@@ -14,7 +14,7 @@ DB_FILE = "inventory.db"
 ADMIN_PIN = "1234"  # Default Admin PIN
 
 def get_connection():
-    return sqlite3.connect(DB_FILE)
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
 
 def init_db():
     conn = get_connection()
@@ -182,11 +182,13 @@ with st.sidebar:
         st.markdown("---")
         # Admin Unlock Toggle
         if not st.session_state.is_admin:
-            pin = st.text_input("Unlock Admin Rights", type="password")
+            pin = st.text_input("Unlock Admin Rights", type="password", key="admin_pin_input")
             if pin == ADMIN_PIN:
                 st.session_state.is_admin = True
                 st.success("Admin Mode Active")
                 st.rerun()
+            elif pin != "":
+                st.error("Incorrect PIN")
         else:
             st.info("🔓 Admin Access Enabled")
             if st.button("Lock Admin"):
@@ -209,7 +211,6 @@ if not st.session_state.logged_in:
 # ==========================================
 # 6. APPLICATION NAVIGATION
 # ==========================================
-# Restrict navigation based on Admin status
 if st.session_state.is_admin:
     tabs = st.tabs(["🛒 Cashier Terminal", "📦 Inventory Control", "📊 Business Reports"])
     tab_pos = tabs[0]
@@ -248,7 +249,7 @@ with tab_pos:
                                 existing_item['qty'] += 1
                                 existing_item['total'] = existing_item['qty'] * existing_item['price']
                             else:
-                                st.error("Out of stock.")
+                                st.error("Cannot add more than available stock.")
                         else:
                             st.session_state.cart.append({
                                 'id': row['id'],
@@ -279,11 +280,16 @@ with tab_pos:
 
         st.markdown("---")
         
-        col_summary, col_payment = st.columns([1.5, 1])
-        
-        with col_summary:
-            st.markdown("### Order Items")
-            if len(st.session_state.cart) > 0:
+        if len(st.session_state.cart) == 0:
+            st.warning("Your cart is empty.")
+            if st.button("Return to Catalog"):
+                st.session_state.checkout_step = "catalog"
+                st.rerun()
+        else:
+            col_summary, col_payment = st.columns([1.5, 1])
+            
+            with col_summary:
+                st.markdown("### Order Items")
                 for index, item in enumerate(st.session_state.cart):
                     col_item_name, col_item_qty, col_item_price, col_item_del = st.columns([3, 1, 1, 0.5])
                     col_item_name.write(item['name'])
@@ -297,16 +303,12 @@ with tab_pos:
                 
                 grand_total = sum(item['total'] for item in st.session_state.cart)
                 st.markdown(f"## **Grand Total: ${grand_total:.2f}**")
-            else:
-                st.write("Cart is empty.")
-                st.session_state.checkout_step = "catalog"
 
-        with col_payment:
-            st.markdown("### Customer & Payment Details")
-            customer_name = st.text_input("Customer Name", value="Walk-in")
-            payment_type = st.radio("Payment Status", ["Paid", "Pay Later / Tab"])
-            
-            if len(st.session_state.cart) > 0:
+            with col_payment:
+                st.markdown("### Customer & Payment Details")
+                customer_name = st.text_input("Customer Name", value="Walk-in", key="cust_name_field")
+                payment_type = st.radio("Payment Status", ["Paid", "Pay Later / Tab"], key="pay_type_field")
+                
                 if st.button("Complete Transaction & Generate Receipt", type="primary"):
                     receipt_id = f"REC-{int(datetime.now().timestamp())}"
                     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
