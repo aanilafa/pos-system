@@ -32,6 +32,12 @@ def init_db():
         )
     ''')
     
+    # Auto-migrate older database versions to include cost_price
+    try:
+        c.execute("ALTER TABLE products ADD COLUMN cost_price REAL NOT NULL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
     # Sales Table
     c.execute('''
         CREATE TABLE IF NOT EXISTS sales (
@@ -49,15 +55,26 @@ def init_db():
         )
     ''')
     
-    # Default products setup
+    # Auto-migrate older database versions for new sales fields
+    for col_def in [
+        ("customer_name", "TEXT NOT NULL DEFAULT 'Walk-in'"),
+        ("payment_type", "TEXT NOT NULL DEFAULT 'Paid'"),
+        ("cost_price", "REAL NOT NULL DEFAULT 0.0"),
+        ("profit", "REAL NOT NULL DEFAULT 0.0")
+    ]:
+        try:
+            c.execute(f"ALTER TABLE sales ADD COLUMN {col_def[0]} {col_def[1]}")
+        except sqlite3.OperationalError:
+            pass
+
+    # Generic sample products setup
     c.execute("SELECT COUNT(*) FROM products")
     if c.fetchone()[0] == 0:
         default_items = [
-            ("Screen Replacement (iPhone 11)", "Repairs", 250.00, 450.00, 10),
-            ("Battery Replacement (Samsung S21)", "Repairs", 120.00, 250.00, 15),
-            ("Network Unlock Code", "Services", 30.00, 150.00, 50),
-            ("Firmware Flashing Service", "Services", 20.00, 100.00, 30),
-            ("USB-C Fast Charger", "Accessories", 35.00, 80.00, 25)
+            ("Standard Product A", "General", 10.00, 25.00, 50),
+            ("Standard Product B", "General", 15.00, 35.00, 40),
+            ("Basic Service Package", "Services", 20.00, 60.00, 100),
+            ("Premium Item", "General", 50.00, 120.00, 20)
         ]
         c.executemany("INSERT INTO products (name, category, cost_price, price, stock) VALUES (?, ?, ?, ?, ?)", default_items)
     
@@ -69,7 +86,7 @@ init_db()
 # ==========================================
 # 2. PAGE CONFIGURATION & STYLING
 # ==========================================
-st.set_page_config(page_title="FLIP FIX TECH - POS", layout="wide", page_icon="📱")
+st.set_page_config(page_title="Point of Sale System", layout="wide", page_icon="🛒")
 
 st.markdown("""
     <style>
@@ -94,7 +111,7 @@ if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 
 if "checkout_step" not in st.session_state:
-    st.session_state.checkout_step = "catalog"  # 'catalog' or 'summary'
+    st.session_state.checkout_step = "catalog"
 
 # ==========================================
 # 4. HELPER FUNCTIONS
@@ -110,11 +127,11 @@ def generate_docx_receipt(receipt_id, cashier, customer, pay_type, cart_items, t
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run("FLIP FIX TECH SOLUTION\n")
+    run = title.add_run("SALES RECEIPT\n")
     run.bold = True
     run.font.size = Pt(13)
     
-    sub = title.add_run("Sales Receipt / Invoice\n")
+    sub = title.add_run("Official Transaction Record\n")
     sub.font.size = Pt(9)
     
     doc.add_paragraph("-" * 35)
@@ -153,7 +170,7 @@ def generate_docx_receipt(receipt_id, cashier, customer, pay_type, cart_items, t
     
     footer = doc.add_paragraph()
     footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    footer.add_run("\nThank you for choosing Flip Fix Tech!")
+    footer.add_run("\nThank you for your business!")
     
     bio = io.BytesIO()
     doc.save(bio)
@@ -163,7 +180,7 @@ def generate_docx_receipt(receipt_id, cashier, customer, pay_type, cart_items, t
 # ==========================================
 # 5. AUTHENTICATION & SIDEBAR
 # ==========================================
-st.title("📱 POS System")
+st.title("🛒 Point of Sale System")
 
 with st.sidebar:
     st.header("Cashier Login")
@@ -180,7 +197,6 @@ with st.sidebar:
         st.success(f"Cashier: **{st.session_state.cashier_name}**")
         
         st.markdown("---")
-        # Admin Unlock Toggle
         if not st.session_state.is_admin:
             pin = st.text_input("Unlock Admin Rights", type="password", key="admin_pin_input")
             if pin == ADMIN_PIN:
@@ -244,6 +260,10 @@ with tab_pos:
                     c3.write(f"Stock: {row['stock']}")
                     if c4.button("Add to Order", key=f"add_{row['id']}"):
                         existing_item = next((item for item in st.session_state.cart if item['id'] == row['id']), None)
+                        
+                        # Safely retrieve cost_price or default to 0.0
+                        item_cost = float(row['cost_price']) if 'cost_price' in row and pd.notna(row['cost_price']) else 0.0
+                        
                         if existing_item:
                             if existing_item['qty'] < row['stock']:
                                 existing_item['qty'] += 1
@@ -254,7 +274,7 @@ with tab_pos:
                             st.session_state.cart.append({
                                 'id': row['id'],
                                 'name': row['name'],
-                                'cost': float(row['cost_price']),
+                                'cost': item_cost,
                                 'price': float(row['price']),
                                 'qty': 1,
                                 'total': float(row['price'])
@@ -331,7 +351,7 @@ with tab_pos:
                     
                     st.success(f"Sale Recorded! Receipt ID: {receipt_id}")
                     st.download_button(
-                        label="📄 Download / Print Thermal Receipt",
+                        label="📄 Download / Print Receipt",
                         data=doc_file,
                         file_name=f"{receipt_id}.docx",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -348,7 +368,7 @@ if st.session_state.is_admin:
         st.subheader("Inventory Management")
         
         conn = get_connection()
-        df_all_products = pd.read_sql_query("SELECT id, name, category, cost_price, price, stock FROM products", conn)
+        df_all_products = pd.read_sql_query("SELECT * FROM products", conn)
         conn.close()
 
         st.dataframe(df_all_products, use_container_width=True)
@@ -358,9 +378,9 @@ if st.session_state.is_admin:
         
         with st.form("inventory_form", clear_on_submit=True):
             prod_name = st.text_input("Product / Service Name")
-            prod_cat = st.selectbox("Category", ["Repairs", "Services", "Accessories", "General"])
-            prod_cost = st.number_input("Cost Price", min_value=0.0, step=5.0)
-            prod_price = st.number_input("Selling Price", min_value=0.0, step=5.0)
+            prod_cat = st.selectbox("Category", ["General", "Services", "Supplies", "Other"])
+            prod_cost = st.number_input("Cost Price", min_value=0.0, step=1.0)
+            prod_price = st.number_input("Selling Price", min_value=0.0, step=1.0)
             prod_stock = st.number_input("Stock Quantity", min_value=0, step=1)
             
             submitted = st.form_submit_button("Save Item")
@@ -393,9 +413,13 @@ if st.session_state.is_admin:
         
         if not df_sales.empty:
             col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-            total_rev = df_sales['total_price'].sum()
-            total_profit = df_sales['profit'].sum()
-            unpaid_total = df_sales[df_sales['payment_type'] == 'Pay Later / Tab']['total_price'].sum()
+            total_rev = df_sales['total_price'].sum() if 'total_price' in df_sales else 0.0
+            total_profit = df_sales['profit'].sum() if 'profit' in df_sales else 0.0
+            
+            if 'payment_type' in df_sales:
+                unpaid_total = df_sales[df_sales['payment_type'] == 'Pay Later / Tab']['total_price'].sum()
+            else:
+                unpaid_total = 0.0
             
             col_m1.metric("Gross Revenue", f"${total_rev:.2f}")
             col_m2.metric("Net Profit", f"${total_profit:.2f}")
@@ -404,9 +428,12 @@ if st.session_state.is_admin:
             
             st.markdown("---")
             st.subheader("Outstanding Customer Tabs")
-            debtors = df_sales[df_sales['payment_type'] == 'Pay Later / Tab']
-            if not debtors.empty:
-                st.dataframe(debtors[['receipt_id', 'timestamp', 'customer_name', 'product_name', 'total_price']], use_container_width=True)
+            if 'payment_type' in df_sales:
+                debtors = df_sales[df_sales['payment_type'] == 'Pay Later / Tab']
+                if not debtors.empty:
+                    st.dataframe(debtors[['receipt_id', 'timestamp', 'customer_name', 'product_name', 'total_price']], use_container_width=True)
+                else:
+                    st.info("No outstanding unpaid tabs.")
             else:
                 st.info("No outstanding unpaid tabs.")
                 
