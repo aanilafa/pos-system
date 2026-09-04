@@ -32,12 +32,6 @@ def init_db():
         )
     ''')
     
-    # Auto-migrate older database versions to include cost_price
-    try:
-        c.execute("ALTER TABLE products ADD COLUMN cost_price REAL NOT NULL DEFAULT 0.0")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    
     # Sales Table
     c.execute('''
         CREATE TABLE IF NOT EXISTS sales (
@@ -55,17 +49,25 @@ def init_db():
         )
     ''')
     
-    # Auto-migrate older database versions for new sales fields
-    for col_def in [
-        ("customer_name", "TEXT NOT NULL DEFAULT 'Walk-in'"),
-        ("payment_type", "TEXT NOT NULL DEFAULT 'Paid'"),
-        ("cost_price", "REAL NOT NULL DEFAULT 0.0"),
-        ("profit", "REAL NOT NULL DEFAULT 0.0")
-    ]:
-        try:
-            c.execute(f"ALTER TABLE sales ADD COLUMN {col_def[0]} {col_def[1]}")
-        except sqlite3.OperationalError:
-            pass
+    # Check and add missing columns to existing database tables (Auto-Migration)
+    c.execute("PRAGMA table_info(products)")
+    existing_product_cols = [col[1] for col in c.fetchall()]
+    if "cost_price" not in existing_product_cols:
+        c.execute("ALTER TABLE products ADD COLUMN cost_price REAL NOT NULL DEFAULT 0.0")
+
+    c.execute("PRAGMA table_info(sales)")
+    existing_sales_cols = [col[1] for col in c.fetchall()]
+    
+    missing_sales_cols = {
+        "customer_name": "TEXT NOT NULL DEFAULT 'Walk-in'",
+        "payment_type": "TEXT NOT NULL DEFAULT 'Paid'",
+        "cost_price": "REAL NOT NULL DEFAULT 0.0",
+        "profit": "REAL NOT NULL DEFAULT 0.0"
+    }
+    
+    for col_name, col_type in missing_sales_cols.items():
+        if col_name not in existing_sales_cols:
+            c.execute(f"ALTER TABLE sales ADD COLUMN {col_name} {col_type}")
 
     # Generic sample products setup
     c.execute("SELECT COUNT(*) FROM products")
@@ -261,7 +263,6 @@ with tab_pos:
                     if c4.button("Add to Order", key=f"add_{row['id']}"):
                         existing_item = next((item for item in st.session_state.cart if item['id'] == row['id']), None)
                         
-                        # Safely retrieve cost_price or default to 0.0
                         item_cost = float(row['cost_price']) if 'cost_price' in row and pd.notna(row['cost_price']) else 0.0
                         
                         if existing_item:
