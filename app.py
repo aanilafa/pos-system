@@ -82,6 +82,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE,
             category TEXT,
+            cost_price REAL DEFAULT 0,
             price REAL,
             stock INTEGER
         )
@@ -98,6 +99,8 @@ def init_db():
             receipt_id TEXT,
             product_name TEXT,
             quantity INTEGER,
+            unit_price REAL DEFAULT 0,
+            discount_amount REAL DEFAULT 0,
             total_price REAL,
             payment_method TEXT,
             cashier TEXT,
@@ -105,10 +108,20 @@ def init_db():
         )
     """)
 
+    # Auto-migrations for columns added after the tables already existed.
     cursor.execute("PRAGMA table_info(sales)")
-    columns = [column[1] for column in cursor.fetchall()]
-    if "receipt_id" not in columns:
+    sales_columns = [column[1] for column in cursor.fetchall()]
+    if "receipt_id" not in sales_columns:
         cursor.execute("ALTER TABLE sales ADD COLUMN receipt_id TEXT")
+    if "discount_amount" not in sales_columns:
+        cursor.execute("ALTER TABLE sales ADD COLUMN discount_amount REAL DEFAULT 0")
+    if "unit_price" not in sales_columns:
+        cursor.execute("ALTER TABLE sales ADD COLUMN unit_price REAL DEFAULT 0")
+
+    cursor.execute("PRAGMA table_info(products)")
+    product_columns = [column[1] for column in cursor.fetchall()]
+    if "cost_price" not in product_columns:
+        cursor.execute("ALTER TABLE products ADD COLUMN cost_price REAL DEFAULT 0")
 
     conn.commit()
     conn.close()
@@ -120,7 +133,7 @@ init_db()
 # ---------------------------------------------------------
 # RECEIPT GENERATION
 # ---------------------------------------------------------
-def generate_receipt_docx(receipt_id, cashier_name, pay_method, cart_items, total_amount):
+def generate_receipt_docx(receipt_id, cashier_name, pay_method, cart_items, subtotal_amount, discount_amount, total_amount, discount_label=""):
     doc = Document()
 
     for section in doc.sections:
@@ -167,6 +180,17 @@ def generate_receipt_docx(receipt_id, cashier_name, pay_method, cart_items, tota
         row_cells[3].text = f"${subtotal:.2f}"
 
     doc.add_paragraph("-" * 100)
+
+    subtotal_p = doc.add_paragraph()
+    subtotal_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    subtotal_p.add_run(f"Subtotal: ${subtotal_amount:.2f}")
+
+    if discount_amount > 0:
+        discount_p = doc.add_paragraph()
+        discount_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        label = f"Discount ({discount_label}): " if discount_label else "Discount: "
+        run_discount = discount_p.add_run(f"{label}-${discount_amount:.2f}")
+        run_discount.font.color.rgb = RGBColor(180, 0, 0)
 
     total_p = doc.add_paragraph()
     total_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
@@ -382,8 +406,46 @@ if role == "🛒 Cashier Terminal":
 
                 st.markdown('</div>', unsafe_allow_html=True)
 
-                grand_total = sum(item["Quantity"] * item["Unit Price ($)"] for item in st.session_state.cart)
+                subtotal = sum(item["Quantity"] * item["Unit Price ($)"] for item in st.session_state.cart)
 
+                # --- Discount (kept outside the form so the total updates live) ---
+                st.markdown("###### Discount")
+                disc_col1, disc_col2 = st.columns([1.3, 1])
+                with disc_col1:
+                    discount_type = st.selectbox(
+                        "Discount type",
+                        ["None", "Percentage (%)", "Fixed Amount ($)"],
+                        key="discount_type",
+                        label_visibility="collapsed",
+                    )
+                with disc_col2:
+                    discount_value = 0.0
+                    if discount_type != "None":
+                        discount_value = st.number_input(
+                            "Discount value",
+                            min_value=0.0,
+                            step=1.0,
+                            format="%.2f",
+                            key="discount_value",
+                            label_visibility="collapsed",
+                        )
+
+                if discount_type == "Percentage (%)":
+                    discount_value = min(discount_value, 100.0)
+                    discount_amount = subtotal * (discount_value / 100.0)
+                    discount_label = f"{discount_value:.0f}%"
+                elif discount_type == "Fixed Amount ($)":
+                    discount_amount = min(discount_value, subtotal)
+                    discount_label = "fixed"
+                else:
+                    discount_amount = 0.0
+                    discount_label = ""
+
+                grand_total = max(0.0, subtotal - discount_amount)
+
+                st.markdown(f"Subtotal: ${subtotal:.2f}")
+                if discount_amount > 0:
+                    st.markdown(f"Discount: −${discount_amount:.2f}")
                 st.markdown(f"### Total: **${grand_total:.2f}**")
 
                 with st.form("multi_checkout_form"):
@@ -412,12 +474,28 @@ if role == "🛒 Cashier Terminal":
                                 st.error(f"⚠️ {stock_problem} Please adjust the quantity.")
                             else:
                                 receipt_id = f"REF-{random.randint(100000, 999999)}"
+                                # Spread the discount across line items proportionally
+                                # to their share of the subtotal, so per-line and
+                                # reporting totals still add up to the discounted total.
                                 for item in st.session_state.cart:
-                                    item_total = item['Quantity'] * item['Unit Price ($)']
+                                    item_subtotal = item['Quantity'] * item['Unit Price ($)']
+                                    item_discount_share = (
+                                        discount_amount * (item_subtotal / subtotal) if subtotal > 0 else 0.0
+                                    )
+                                    item_total = item_subtotal - item_discount_share
                                     cursor.execute(
-                                        """INSERT INTO sales (receipt_id, product_name, quantity, total_price, payment_method, cashier)
-                                           VALUES (?, ?, ?, ?, ?, ?)""",
-                                        (receipt_id, item['Product Name'], item['Quantity'], item_total, pay_method, st.session_state.active_cashier)
+                                        """INSERT INTO sales (receipt_id, product_name, quantity, unit_price, discount_amount, total_price, payment_method, cashier)
+                                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                        (
+                                            receipt_id,
+                                            item['Product Name'],
+                                            item['Quantity'],
+                                            item['Unit Price ($)'],
+                                            item_discount_share,
+                                            item_total,
+                                            pay_method,
+                                            st.session_state.active_cashier,
+                                        )
                                     )
                                     cursor.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (item['Quantity'], item['id']))
 
@@ -425,10 +503,12 @@ if role == "🛒 Cashier Terminal":
                                 conn.close()
 
                                 docx_bytes = generate_receipt_docx(
-                                    receipt_id, st.session_state.active_cashier, pay_method, st.session_state.cart, grand_total
+                                    receipt_id, st.session_state.active_cashier, pay_method, st.session_state.cart,
+                                    subtotal, discount_amount, grand_total, discount_label,
                                 )
                                 st.session_state.last_receipt = {"id": receipt_id, "docx_data": docx_bytes}
                                 st.session_state.cart = []
+                                st.session_state.discount_type = "None"
                                 st.rerun()
 
                 if st.button("🚫 Cancel Entire Order", type="secondary", use_container_width=True):
@@ -451,7 +531,18 @@ elif role == "📦 Stock Inventory":
         df_display["Status"] = df_display["stock"].apply(
             lambda x: "Low Stock" if 0 < x <= 3 else ("Out of Stock" if x <= 0 else "In Stock")
         )
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
+        df_display = df_display.rename(columns={"cost_price": "Unit Cost", "price": "Selling Price"})
+        df_display["Margin"] = df_display["Selling Price"] - df_display["Unit Cost"]
+        st.dataframe(
+            df_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
+                "Selling Price": st.column_config.NumberColumn(format="$%.2f"),
+                "Margin": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
     else:
         st.info("No items found in stock database yet.")
 
@@ -463,7 +554,13 @@ elif role == "📦 Stock Inventory":
         with st.form("product_form"):
             p_name = st.text_input("Product Name")
             p_cat = st.selectbox("Category", CATEGORIES)
-            p_price = st.number_input("Unit Price ($)", min_value=0.0, format="%.2f")
+            cost_col, price_col = st.columns(2)
+            with cost_col:
+                p_cost = st.number_input("Unit Cost ($)", min_value=0.0, format="%.2f", help="What you pay to acquire/stock this item.")
+            with price_col:
+                p_price = st.number_input("Selling Price ($)", min_value=0.0, format="%.2f", help="What the customer pays.")
+            if p_price < p_cost:
+                st.caption("⚠️ Selling price is below unit cost — this item would sell at a loss.")
             p_stock = st.number_input("Stock Quantity", min_value=0, step=1)
             st.caption("If this name already exists, the quantity entered here will be **added** to existing stock (restock), not replace it.")
 
@@ -480,16 +577,16 @@ elif role == "📦 Stock Inventory":
 
                     if existing:
                         cursor.execute(
-                            "UPDATE products SET category = ?, price = ?, stock = stock + ? WHERE name = ?",
-                            (p_cat, p_price, p_stock, p_name.strip()),
+                            "UPDATE products SET category = ?, cost_price = ?, price = ?, stock = stock + ? WHERE name = ?",
+                            (p_cat, p_cost, p_price, p_stock, p_name.strip()),
                         )
                         conn.commit()
                         conn.close()
                         st.success(f"'{p_name}' already existed — restocked by {p_stock} units.")
                     else:
                         cursor.execute(
-                            "INSERT INTO products (name, category, price, stock) VALUES (?, ?, ?, ?)",
-                            (p_name.strip(), p_cat, p_price, p_stock),
+                            "INSERT INTO products (name, category, cost_price, price, stock) VALUES (?, ?, ?, ?, ?)",
+                            (p_name.strip(), p_cat, p_cost, p_price, p_stock),
                         )
                         conn.commit()
                         conn.close()
@@ -508,9 +605,17 @@ elif role == "📦 Stock Inventory":
                 edit_cat = st.selectbox(
                     "Category", CATEGORIES, index=CATEGORIES.index(current_item["category"])
                 )
-                edit_price = st.number_input(
-                    "Unit Price ($)", min_value=0.0, value=float(current_item["price"]), format="%.2f"
-                )
+                edit_cost_col, edit_price_col = st.columns(2)
+                with edit_cost_col:
+                    edit_cost = st.number_input(
+                        "Unit Cost ($)", min_value=0.0, value=float(current_item.get("cost_price", 0.0) or 0.0), format="%.2f"
+                    )
+                with edit_price_col:
+                    edit_price = st.number_input(
+                        "Selling Price ($)", min_value=0.0, value=float(current_item["price"]), format="%.2f"
+                    )
+                if edit_price < edit_cost:
+                    st.caption("⚠️ Selling price is below unit cost — this item would sell at a loss.")
                 edit_stock = st.number_input(
                     "Exact Stock Count", min_value=0, value=int(current_item["stock"]), step=1
                 )
@@ -525,8 +630,8 @@ elif role == "📦 Stock Inventory":
                         conn = get_connection()
                         cursor = conn.cursor()
                         cursor.execute(
-                            "UPDATE products SET name = ?, category = ?, price = ?, stock = ? WHERE id = ?",
-                            (edit_name.strip(), edit_cat, edit_price, edit_stock, int(current_item["id"])),
+                            "UPDATE products SET name = ?, category = ?, cost_price = ?, price = ?, stock = ? WHERE id = ?",
+                            (edit_name.strip(), edit_cat, edit_cost, edit_price, edit_stock, int(current_item["id"])),
                         )
                         conn.commit()
                         conn.close()
@@ -597,9 +702,14 @@ elif role == "📊 Admin Dashboard":
         else:
             filtered_df = pd.DataFrame()
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         daily_revenue = filtered_df['total_price'].sum() if not filtered_df.empty else 0.0
         daily_items = filtered_df['quantity'].sum() if not filtered_df.empty else 0
+        daily_discounts = (
+            filtered_df['discount_amount'].sum()
+            if not filtered_df.empty and 'discount_amount' in filtered_df.columns
+            else 0.0
+        )
         top_product = (
             filtered_df.groupby('product_name')['quantity'].sum().idxmax()
             if not filtered_df.empty else "N/A"
@@ -607,7 +717,8 @@ elif role == "📊 Admin Dashboard":
 
         col1.metric("Revenue", f"${daily_revenue:.2f}")
         col2.metric("Items Sold", int(daily_items))
-        col3.metric("Top Moving Product", top_product)
+        col3.metric("Discounts Given", f"${daily_discounts:.2f}")
+        col4.metric("Top Moving Product", top_product)
 
         st.markdown(f"##### Sales Log — {selected_date}")
         if filtered_df.empty:
