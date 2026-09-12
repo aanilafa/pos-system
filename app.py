@@ -68,6 +68,15 @@ CATEGORIES = ["Patch", "Tube", "Tires", "Car Wash", "Others"]
 PAYMENT_METHODS = ["Cash", "Card", "Bank Transfer"]
 
 
+def format_product_label(row):
+    """Build a display label that stays unique even when multiple rows
+    share the same product name (e.g. the same item stocked at different
+    markups/price tiers)."""
+    variant = (row.get('variant_label') or '').strip() if hasattr(row, 'get') else (row['variant_label'] or '').strip()
+    variant_part = f" · {variant}" if variant else ""
+    return f"{row['name']}{variant_part} — ${row['price']:.2f} (#{int(row['id'])})"
+
+
 def get_connection():
     conn = sqlite3.connect("inventory.db")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -80,7 +89,8 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE,
+            name TEXT,
+            variant_label TEXT DEFAULT '',
             category TEXT,
             cost_price REAL DEFAULT 0,
             price REAL,
@@ -108,6 +118,34 @@ def init_db():
         )
     """)
 
+    # If products still has the old UNIQUE(name) constraint from an earlier
+    # version, rebuild the table without it so the same product name can be
+    # stocked more than once (e.g. sold at different markups/price tiers).
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='products'")
+    row = cursor.fetchone()
+    if row and row[0] and "UNIQUE" in row[0]:
+        cursor.execute("PRAGMA table_info(products)")
+        old_cols = [c[1] for c in cursor.fetchall()]
+        cursor.execute("ALTER TABLE products RENAME TO products_old")
+        cursor.execute("""
+            CREATE TABLE products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                variant_label TEXT DEFAULT '',
+                category TEXT,
+                cost_price REAL DEFAULT 0,
+                price REAL,
+                stock INTEGER
+            )
+        """)
+        cost_select = "cost_price" if "cost_price" in old_cols else "0"
+        variant_select = "variant_label" if "variant_label" in old_cols else "''"
+        cursor.execute(f"""
+            INSERT INTO products (id, name, variant_label, category, cost_price, price, stock)
+            SELECT id, name, {variant_select}, category, {cost_select}, price, stock FROM products_old
+        """)
+        cursor.execute("DROP TABLE products_old")
+
     # Auto-migrations for columns added after the tables already existed.
     cursor.execute("PRAGMA table_info(sales)")
     sales_columns = [column[1] for column in cursor.fetchall()]
@@ -122,6 +160,8 @@ def init_db():
     product_columns = [column[1] for column in cursor.fetchall()]
     if "cost_price" not in product_columns:
         cursor.execute("ALTER TABLE products ADD COLUMN cost_price REAL DEFAULT 0")
+    if "variant_label" not in product_columns:
+        cursor.execute("ALTER TABLE products ADD COLUMN variant_label TEXT DEFAULT ''")
 
     conn.commit()
     conn.close()
@@ -207,6 +247,61 @@ def generate_receipt_docx(receipt_id, cashier_name, pay_method, cart_items, subt
     target_stream = io.BytesIO()
     doc.save(target_stream)
     return target_stream.getvalue()
+
+
+def _save_new_product():
+    """on_click callback for the Add Product button.
+
+    Runs BEFORE the widgets are re-instantiated on the next script run, so
+    it's the safe place to both save the product and clear the input
+    fields (resetting st.session_state for a widget's key AFTER that widget
+    has already been drawn in the same run raises a StreamlitAPIException).
+    """
+    name = st.session_state.get("add_p_name", "").strip()
+    variant = st.session_state.get("add_p_variant", "").strip()
+    cat = st.session_state.get("add_p_cat", CATEGORIES[0])
+    cost = st.session_state.get("add_p_cost", 0.0)
+    markup = st.session_state.get("add_p_markup", 0.0)
+    stock = st.session_state.get("add_p_stock", 0)
+    price = cost + markup
+
+    if not name:
+        st.session_state["add_product_feedback"] = ("error", "Product name cannot be empty.")
+        return
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM products WHERE name = ? AND price = ? AND IFNULL(variant_label, '') = ?",
+        (name, price, variant),
+    )
+    existing = cursor.fetchone()
+
+    if existing:
+        cursor.execute(
+            "UPDATE products SET category = ?, cost_price = ?, stock = stock + ? WHERE id = ?",
+            (cat, cost, stock, existing[0]),
+        )
+        conn.commit()
+        conn.close()
+        st.session_state["add_product_feedback"] = (
+            "success", f"'{name}' already existed at this price/tier — restocked by {stock} units."
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO products (name, variant_label, category, cost_price, price, stock) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, variant, cat, cost, price, stock),
+        )
+        conn.commit()
+        conn.close()
+        st.session_state["add_product_feedback"] = ("success", f"Inventory record for '{name}' created.")
+
+    # Safe here (pre-rerun) — clears the form for the next entry.
+    st.session_state["add_p_name"] = ""
+    st.session_state["add_p_variant"] = ""
+    st.session_state["add_p_cost"] = 0.0
+    st.session_state["add_p_markup"] = 0.0
+    st.session_state["add_p_stock"] = 0
 
 
 # ---------------------------------------------------------
@@ -325,7 +420,10 @@ if role == "🛒 Cashier Terminal":
                         else:
                             stock_status = f"Stock: {stock_qty}"
 
-                        btn_label = f"{row['name']}\n${row['price']:.2f} | {stock_status}"
+                        display_name = row['name']
+                        if str(row.get('variant_label') or '').strip():
+                            display_name = f"{row['name']} ({row['variant_label']})"
+                        btn_label = f"{display_name}\n${row['price']:.2f} | {stock_status}"
 
                         st.markdown('<div class="product-btn">', unsafe_allow_html=True)
                         disabled = stock_qty <= 0
@@ -531,10 +629,15 @@ elif role == "📦 Stock Inventory":
         df_display["Status"] = df_display["stock"].apply(
             lambda x: "Low Stock" if 0 < x <= 3 else ("Out of Stock" if x <= 0 else "In Stock")
         )
-        df_display = df_display.rename(columns={"cost_price": "Unit Cost", "price": "Selling Price"})
+        df_display = df_display.rename(columns={
+            "cost_price": "Unit Cost",
+            "price": "Selling Price",
+            "variant_label": "Price Tier / Variant",
+        })
         df_display["Margin"] = df_display["Selling Price"] - df_display["Unit Cost"]
+        column_order = [c for c in ["id", "name", "Price Tier / Variant", "category", "Unit Cost", "Selling Price", "Margin", "stock", "Status"] if c in df_display.columns]
         st.dataframe(
-            df_display,
+            df_display[column_order],
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -551,115 +654,124 @@ elif role == "📦 Stock Inventory":
     inv_tab1, inv_tab2, inv_tab3 = st.tabs(["➕ Add Product", "✏️ Edit Product", "🗑️ Delete Product"])
 
     with inv_tab1:
-        with st.form("product_form"):
-            p_name = st.text_input("Product Name")
-            p_cat = st.selectbox("Category", CATEGORIES)
-            cost_col, price_col = st.columns(2)
-            with cost_col:
-                p_cost = st.number_input("Unit Cost ($)", min_value=0.0, format="%.2f", help="What you pay to acquire/stock this item.")
-            with price_col:
-                p_price = st.number_input("Selling Price ($)", min_value=0.0, format="%.2f", help="What the customer pays.")
-            if p_price < p_cost:
-                st.caption("⚠️ Selling price is below unit cost — this item would sell at a loss.")
-            p_stock = st.number_input("Stock Quantity", min_value=0, step=1)
-            st.caption("If this name already exists, the quantity entered here will be **added** to existing stock (restock), not replace it.")
+        st.caption("Enter what you pay (Unit Cost) and how much to add on top (Markup) — the Selling Price is calculated for you.")
+        st.text_input("Product Name", key="add_p_name")
+        st.text_input(
+            "Price Tier / Variant Label (optional)",
+            placeholder="e.g. Retail, Wholesale, Premium",
+            help="Use this to stock the same product name at more than one markup — e.g. the same tire sold "
+                 "at a 'Retail' price and a 'Wholesale' price as two separate lines.",
+            key="add_p_variant",
+        )
+        st.selectbox("Category", CATEGORIES, key="add_p_cat")
+        cost_col, markup_col, price_col = st.columns(3)
+        with cost_col:
+            st.number_input("Unit Cost ($)", min_value=0.0, format="%.2f", help="What you pay to acquire/stock this item.", key="add_p_cost")
+        with markup_col:
+            st.number_input("Markup ($)", min_value=0.0, format="%.2f", help="Amount added on top of unit cost.", key="add_p_markup")
+        preview_price = st.session_state.get("add_p_cost", 0.0) + st.session_state.get("add_p_markup", 0.0)
+        with price_col:
+            st.metric("Selling Price", f"${preview_price:.2f}")
+        st.number_input("Stock Quantity", min_value=0, step=1, key="add_p_stock")
+        st.caption(
+            "If a product with this **exact same name, price, and tier label** already exists, the quantity "
+            "entered here will be **added** to its existing stock (restock). A different price or label "
+            "creates a separate line — useful for selling the same item at more than one markup."
+        )
 
-            save = st.form_submit_button("Save Item", type="primary")
+        st.button("Save Item", type="primary", on_click=_save_new_product)
 
-            if save:
-                if not p_name.strip():
-                    st.error("Product name cannot be empty.")
-                else:
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT id FROM products WHERE name = ?", (p_name.strip(),))
-                    existing = cursor.fetchone()
-
-                    if existing:
-                        cursor.execute(
-                            "UPDATE products SET category = ?, cost_price = ?, price = ?, stock = stock + ? WHERE name = ?",
-                            (p_cat, p_cost, p_price, p_stock, p_name.strip()),
-                        )
-                        conn.commit()
-                        conn.close()
-                        st.success(f"'{p_name}' already existed — restocked by {p_stock} units.")
-                    else:
-                        cursor.execute(
-                            "INSERT INTO products (name, category, cost_price, price, stock) VALUES (?, ?, ?, ?, ?)",
-                            (p_name.strip(), p_cat, p_cost, p_price, p_stock),
-                        )
-                        conn.commit()
-                        conn.close()
-                        st.success(f"Inventory record for '{p_name}' created.")
-                    st.rerun()
+        feedback = st.session_state.pop("add_product_feedback", None)
+        if feedback:
+            kind, message = feedback
+            getattr(st, kind)(message)
 
     with inv_tab2:
         if df_products.empty:
             st.caption("No products to edit yet.")
         else:
-            with st.form("edit_product_form"):
-                selected_prod = st.selectbox("Select Product", df_products["name"].tolist())
-                current_item = df_products[df_products["name"] == selected_prod].iloc[0]
+            df_products["_label"] = df_products.apply(format_product_label, axis=1)
+            label_to_id = dict(zip(df_products["_label"], df_products["id"]))
 
-                edit_name = st.text_input("Product Name", value=current_item["name"])
-                edit_cat = st.selectbox(
-                    "Category", CATEGORIES, index=CATEGORIES.index(current_item["category"])
+            selected_label = st.selectbox("Select Product", df_products["_label"].tolist(), key="edit_select_label")
+            current_item = df_products[df_products["id"] == label_to_id[selected_label]].iloc[0]
+            pid = int(current_item["id"])
+            existing_cost = float(current_item.get("cost_price", 0.0) or 0.0)
+            existing_price = float(current_item["price"])
+            existing_markup = max(0.0, existing_price - existing_cost)
+
+            # Key widgets by product id so switching the selected product
+            # resets the fields to that product's own values.
+            edit_name = st.text_input("Product Name", value=current_item["name"], key=f"edit_name_{pid}")
+            edit_variant = st.text_input(
+                "Price Tier / Variant Label (optional)",
+                value=str(current_item.get("variant_label") or ""),
+                placeholder="e.g. Retail, Wholesale, Premium",
+                key=f"edit_variant_{pid}",
+            )
+            edit_cat = st.selectbox(
+                "Category", CATEGORIES, index=CATEGORIES.index(current_item["category"]), key=f"edit_cat_{pid}"
+            )
+            edit_cost_col, edit_markup_col, edit_price_col = st.columns(3)
+            with edit_cost_col:
+                edit_cost = st.number_input(
+                    "Unit Cost ($)", min_value=0.0, value=existing_cost, format="%.2f", key=f"edit_cost_{pid}"
                 )
-                edit_cost_col, edit_price_col = st.columns(2)
-                with edit_cost_col:
-                    edit_cost = st.number_input(
-                        "Unit Cost ($)", min_value=0.0, value=float(current_item.get("cost_price", 0.0) or 0.0), format="%.2f"
-                    )
-                with edit_price_col:
-                    edit_price = st.number_input(
-                        "Selling Price ($)", min_value=0.0, value=float(current_item["price"]), format="%.2f"
-                    )
-                if edit_price < edit_cost:
-                    st.caption("⚠️ Selling price is below unit cost — this item would sell at a loss.")
-                edit_stock = st.number_input(
-                    "Exact Stock Count", min_value=0, value=int(current_item["stock"]), step=1
+            with edit_markup_col:
+                edit_markup = st.number_input(
+                    "Markup ($)", min_value=0.0, value=existing_markup, format="%.2f", key=f"edit_markup_{pid}"
                 )
-                st.caption("This sets the **exact** stock count (overwrite), unlike Add Product which restocks additively.")
+            edit_price = edit_cost + edit_markup
+            with edit_price_col:
+                st.metric("Selling Price", f"${edit_price:.2f}")
+            edit_stock = st.number_input(
+                "Exact Stock Count", min_value=0, value=int(current_item["stock"]), step=1, key=f"edit_stock_{pid}"
+            )
+            st.caption("This sets the **exact** stock count (overwrite), unlike Add Product which restocks additively.")
 
-                update_submit = st.form_submit_button("Update Product", type="primary")
+            update_submit = st.button("Update Product", type="primary")
 
-                if update_submit:
-                    if not edit_name.strip():
-                        st.error("Product name cannot be empty.")
-                    else:
-                        conn = get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            "UPDATE products SET name = ?, category = ?, cost_price = ?, price = ?, stock = ? WHERE id = ?",
-                            (edit_name.strip(), edit_cat, edit_cost, edit_price, edit_stock, int(current_item["id"])),
-                        )
-                        conn.commit()
-                        conn.close()
-                        st.success(f"Updated product details for '{edit_name}'.")
-                        st.rerun()
+            if update_submit:
+                if not edit_name.strip():
+                    st.error("Product name cannot be empty.")
+                else:
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE products SET name = ?, variant_label = ?, category = ?, cost_price = ?, price = ?, stock = ? WHERE id = ?",
+                        (edit_name.strip(), edit_variant.strip(), edit_cat, edit_cost, edit_price, edit_stock, pid),
+                    )
+                    conn.commit()
+                    conn.close()
+                    st.success(f"Updated product details for '{edit_name}'.")
+                    st.rerun()
 
     with inv_tab3:
         if df_products.empty:
             st.caption("No products to delete yet.")
         else:
-            delete_prod_name = st.selectbox("Select Product to Remove", df_products["name"].tolist(), key="del_select")
+            df_products["_label"] = df_products.apply(format_product_label, axis=1)
+            label_to_id = dict(zip(df_products["_label"], df_products["id"]))
 
-            if st.session_state.confirm_delete_product != delete_prod_name:
+            delete_label = st.selectbox("Select Product to Remove", df_products["_label"].tolist(), key="del_select")
+            delete_prod_id = label_to_id[delete_label]
+
+            if st.session_state.confirm_delete_product != delete_prod_id:
                 if st.button("🗑️ Delete Product", type="secondary"):
-                    st.session_state.confirm_delete_product = delete_prod_name
+                    st.session_state.confirm_delete_product = delete_prod_id
                     st.rerun()
             else:
-                st.warning(f"Are you sure you want to permanently delete **{delete_prod_name}**? This cannot be undone.")
+                st.warning(f"Are you sure you want to permanently delete **{delete_label}**? This cannot be undone.")
                 conf_col1, conf_col2 = st.columns(2)
                 with conf_col1:
                     if st.button("Yes, delete it", type="primary", use_container_width=True):
                         conn = get_connection()
                         cursor = conn.cursor()
-                        cursor.execute("DELETE FROM products WHERE name = ?", (delete_prod_name,))
+                        cursor.execute("DELETE FROM products WHERE id = ?", (int(delete_prod_id),))
                         conn.commit()
                         conn.close()
                         st.session_state.confirm_delete_product = None
-                        st.success(f"Removed '{delete_prod_name}' from inventory.")
+                        st.success(f"Removed '{delete_label}' from inventory.")
                         st.rerun()
                 with conf_col2:
                     if st.button("Cancel", use_container_width=True):
