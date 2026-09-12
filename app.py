@@ -304,6 +304,94 @@ def _save_new_product():
     st.session_state["add_p_stock"] = 0
 
 
+def _complete_transaction():
+    """on_click callback for the Complete Transaction button.
+
+    Runs BEFORE the widgets are re-instantiated on the next script run, so
+    it's the safe place to clear the cart and reset the discount fields
+    (resetting st.session_state for a widget's key AFTER that widget has
+    already been drawn in the same run raises a StreamlitAPIException).
+    """
+    if not st.session_state.cart:
+        st.session_state["checkout_feedback"] = ("error", "Cart contains no items.")
+        return
+
+    pay_method = st.session_state.get("checkout_pay_method", PAYMENT_METHODS[0])
+    discount_type = st.session_state.get("discount_type", "None")
+    discount_value = st.session_state.get("discount_value", 0.0)
+
+    subtotal = sum(item["Quantity"] * item["Unit Price ($)"] for item in st.session_state.cart)
+
+    if discount_type == "Percentage (%)":
+        discount_value = min(discount_value, 100.0)
+        discount_amount = subtotal * (discount_value / 100.0)
+        discount_label = f"{discount_value:.0f}%"
+    elif discount_type == "Fixed Amount ($)":
+        discount_amount = min(discount_value, subtotal)
+        discount_label = "fixed"
+    else:
+        discount_amount = 0.0
+        discount_label = ""
+
+    grand_total = max(0.0, subtotal - discount_amount)
+
+    # Re-verify current stock right before committing the sale, in case it
+    # changed since items were added to the cart.
+    conn = get_connection()
+    cursor = conn.cursor()
+    stock_problem = None
+    for item in st.session_state.cart:
+        cursor.execute("SELECT stock FROM products WHERE id = ?", (item['id'],))
+        row = cursor.fetchone()
+        current_stock = row[0] if row else 0
+        if item['Quantity'] > current_stock:
+            stock_problem = f"{item['Product Name']} only has {current_stock} left in stock."
+            break
+
+    if stock_problem:
+        conn.close()
+        st.session_state["checkout_feedback"] = ("error", f"⚠️ {stock_problem} Please adjust the quantity.")
+        return
+
+    receipt_id = f"REF-{random.randint(100000, 999999)}"
+    # Spread the discount across line items proportionally to their share of
+    # the subtotal, so per-line and reporting totals still add up to the
+    # discounted total.
+    for item in st.session_state.cart:
+        item_subtotal = item['Quantity'] * item['Unit Price ($)']
+        item_discount_share = discount_amount * (item_subtotal / subtotal) if subtotal > 0 else 0.0
+        item_total = item_subtotal - item_discount_share
+        cursor.execute(
+            """INSERT INTO sales (receipt_id, product_name, quantity, unit_price, discount_amount, total_price, payment_method, cashier)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                receipt_id,
+                item['Product Name'],
+                item['Quantity'],
+                item['Unit Price ($)'],
+                item_discount_share,
+                item_total,
+                pay_method,
+                st.session_state.active_cashier,
+            )
+        )
+        cursor.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (item['Quantity'], item['id']))
+
+    conn.commit()
+    conn.close()
+
+    docx_bytes = generate_receipt_docx(
+        receipt_id, st.session_state.active_cashier, pay_method, st.session_state.cart,
+        subtotal, discount_amount, grand_total, discount_label,
+    )
+    st.session_state.last_receipt = {"id": receipt_id, "docx_data": docx_bytes}
+    st.session_state.cart = []
+    # Safe here (pre-rerun) — clears the discount for the next transaction.
+    st.session_state["discount_type"] = "None"
+    st.session_state["discount_value"] = 0.0
+    st.session_state["checkout_feedback"] = None
+
+
 # ---------------------------------------------------------
 # SESSION STATE
 # ---------------------------------------------------------
@@ -546,68 +634,16 @@ if role == "🛒 Cashier Terminal":
                     st.markdown(f"Discount: −${discount_amount:.2f}")
                 st.markdown(f"### Total: **${grand_total:.2f}**")
 
-                with st.form("multi_checkout_form"):
-                    pay_method = st.selectbox("Payment Method", PAYMENT_METHODS)
-                    submit_sale = st.form_submit_button("✅ Complete Transaction", type="primary", use_container_width=True)
+                pay_method = st.selectbox("Payment Method", PAYMENT_METHODS, key="checkout_pay_method")
+                st.button(
+                    "✅ Complete Transaction", type="primary", use_container_width=True,
+                    on_click=_complete_transaction,
+                )
 
-                    if submit_sale:
-                        if not st.session_state.cart:
-                            st.error("Cart contains no items.")
-                        else:
-                            # Re-verify current stock right before committing the
-                            # sale, in case it changed since items were added.
-                            conn = get_connection()
-                            cursor = conn.cursor()
-                            stock_problem = None
-                            for item in st.session_state.cart:
-                                cursor.execute("SELECT stock FROM products WHERE id = ?", (item['id'],))
-                                row = cursor.fetchone()
-                                current_stock = row[0] if row else 0
-                                if item['Quantity'] > current_stock:
-                                    stock_problem = f"{item['Product Name']} only has {current_stock} left in stock."
-                                    break
-
-                            if stock_problem:
-                                conn.close()
-                                st.error(f"⚠️ {stock_problem} Please adjust the quantity.")
-                            else:
-                                receipt_id = f"REF-{random.randint(100000, 999999)}"
-                                # Spread the discount across line items proportionally
-                                # to their share of the subtotal, so per-line and
-                                # reporting totals still add up to the discounted total.
-                                for item in st.session_state.cart:
-                                    item_subtotal = item['Quantity'] * item['Unit Price ($)']
-                                    item_discount_share = (
-                                        discount_amount * (item_subtotal / subtotal) if subtotal > 0 else 0.0
-                                    )
-                                    item_total = item_subtotal - item_discount_share
-                                    cursor.execute(
-                                        """INSERT INTO sales (receipt_id, product_name, quantity, unit_price, discount_amount, total_price, payment_method, cashier)
-                                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                                        (
-                                            receipt_id,
-                                            item['Product Name'],
-                                            item['Quantity'],
-                                            item['Unit Price ($)'],
-                                            item_discount_share,
-                                            item_total,
-                                            pay_method,
-                                            st.session_state.active_cashier,
-                                        )
-                                    )
-                                    cursor.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (item['Quantity'], item['id']))
-
-                                conn.commit()
-                                conn.close()
-
-                                docx_bytes = generate_receipt_docx(
-                                    receipt_id, st.session_state.active_cashier, pay_method, st.session_state.cart,
-                                    subtotal, discount_amount, grand_total, discount_label,
-                                )
-                                st.session_state.last_receipt = {"id": receipt_id, "docx_data": docx_bytes}
-                                st.session_state.cart = []
-                                st.session_state.discount_type = "None"
-                                st.rerun()
+                checkout_feedback = st.session_state.pop("checkout_feedback", None)
+                if checkout_feedback:
+                    kind, message = checkout_feedback
+                    getattr(st, kind)(message)
 
                 if st.button("🚫 Cancel Entire Order", type="secondary", use_container_width=True):
                     st.session_state.cart = []
