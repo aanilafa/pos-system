@@ -8,6 +8,8 @@ from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="POS & Inventory System", layout="wide", page_icon="🧾")
 
@@ -77,6 +79,94 @@ def format_product_label(row):
     return f"{row['name']}{variant_part} — ${row['price']:.2f} (#{int(row['id'])})"
 
 
+# Money columns get a currency number format and right alignment in exports.
+CURRENCY_COLUMNS = {"Unit Cost", "Unit Price", "Discount", "Total", "Profit", "Margin", "Selling Price"}
+
+
+def build_formatted_sales_excel(df, sheet_name):
+    """Return bytes for a nicely formatted .xlsx export of a sales dataframe,
+    including per-line unit cost/unit price and a computed profit column."""
+    export_df = df.copy()
+
+    # Compute profit per line (revenue actually collected minus what the
+    # stock cost us) before renaming columns for display.
+    if "unit_cost" in export_df.columns and "quantity" in export_df.columns and "total_price" in export_df.columns:
+        export_df["profit"] = export_df["total_price"] - (export_df["unit_cost"] * export_df["quantity"])
+
+    rename_map = {
+        "id": "Sale ID",
+        "receipt_id": "Receipt Ref",
+        "product_name": "Product",
+        "quantity": "Qty",
+        "unit_cost": "Unit Cost",
+        "unit_price": "Unit Price",
+        "discount_amount": "Discount",
+        "total_price": "Total",
+        "profit": "Profit",
+        "payment_method": "Payment Method",
+        "cashier": "Cashier",
+        "timestamp": "Timestamp",
+    }
+    export_df = export_df.rename(columns=rename_map)
+    ordered_cols = [c for c in [
+        "Sale ID", "Receipt Ref", "Timestamp", "Product", "Qty",
+        "Unit Cost", "Unit Price", "Discount", "Total", "Profit",
+        "Payment Method", "Cashier",
+    ] if c in export_df.columns]
+    export_df = export_df[ordered_cols]
+
+    excel_buffer = io.BytesIO()
+    sheet_name = sheet_name[:31]  # Excel sheet name limit
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        export_df.to_excel(writer, index=False, sheet_name=sheet_name)
+        worksheet = writer.sheets[sheet_name]
+
+        header_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+        header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+        body_font = Font(name="Arial", size=10)
+        thin_border = Border(
+            left=Side(style="thin", color="D9D9D9"),
+            right=Side(style="thin", color="D9D9D9"),
+            top=Side(style="thin", color="D9D9D9"),
+            bottom=Side(style="thin", color="D9D9D9"),
+        )
+
+        n_rows = worksheet.max_row
+        n_cols = worksheet.max_column
+
+        for col_idx in range(1, n_cols + 1):
+            header_cell = worksheet.cell(row=1, column=col_idx)
+            header_cell.font = header_font
+            header_cell.fill = header_fill
+            header_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            header_cell.border = thin_border
+
+            col_name = export_df.columns[col_idx - 1]
+            is_currency = col_name in CURRENCY_COLUMNS
+
+            for row_idx in range(2, n_rows + 1):
+                cell = worksheet.cell(row=row_idx, column=col_idx)
+                cell.font = body_font
+                cell.border = thin_border
+                if is_currency:
+                    cell.number_format = '"$"#,##0.00'
+                    cell.alignment = Alignment(horizontal="right")
+                else:
+                    cell.alignment = Alignment(horizontal="left")
+
+            col_letter = get_column_letter(col_idx)
+            max_len = max(
+                [len(str(col_name))] + [len(str(worksheet.cell(row=r, column=col_idx).value or "")) for r in range(2, n_rows + 1)]
+            )
+            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        worksheet.row_dimensions[1].height = 28
+
+    return excel_buffer.getvalue()
+
+
 def get_connection():
     conn = sqlite3.connect("inventory.db")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -109,6 +199,7 @@ def init_db():
             receipt_id TEXT,
             product_name TEXT,
             quantity INTEGER,
+            unit_cost REAL DEFAULT 0,
             unit_price REAL DEFAULT 0,
             discount_amount REAL DEFAULT 0,
             total_price REAL,
@@ -155,6 +246,8 @@ def init_db():
         cursor.execute("ALTER TABLE sales ADD COLUMN discount_amount REAL DEFAULT 0")
     if "unit_price" not in sales_columns:
         cursor.execute("ALTER TABLE sales ADD COLUMN unit_price REAL DEFAULT 0")
+    if "unit_cost" not in sales_columns:
+        cursor.execute("ALTER TABLE sales ADD COLUMN unit_cost REAL DEFAULT 0")
 
     cursor.execute("PRAGMA table_info(products)")
     product_columns = [column[1] for column in cursor.fetchall()]
@@ -340,10 +433,12 @@ def _complete_transaction():
     conn = get_connection()
     cursor = conn.cursor()
     stock_problem = None
+    product_costs = {}
     for item in st.session_state.cart:
-        cursor.execute("SELECT stock FROM products WHERE id = ?", (item['id'],))
+        cursor.execute("SELECT stock, cost_price FROM products WHERE id = ?", (item['id'],))
         row = cursor.fetchone()
         current_stock = row[0] if row else 0
+        product_costs[item['id']] = row[1] if row and row[1] is not None else 0.0
         if item['Quantity'] > current_stock:
             stock_problem = f"{item['Product Name']} only has {current_stock} left in stock."
             break
@@ -362,12 +457,13 @@ def _complete_transaction():
         item_discount_share = discount_amount * (item_subtotal / subtotal) if subtotal > 0 else 0.0
         item_total = item_subtotal - item_discount_share
         cursor.execute(
-            """INSERT INTO sales (receipt_id, product_name, quantity, unit_price, discount_amount, total_price, payment_method, cashier)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO sales (receipt_id, product_name, quantity, unit_cost, unit_price, discount_amount, total_price, payment_method, cashier)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 receipt_id,
                 item['Product Name'],
                 item['Quantity'],
+                product_costs.get(item['id'], 0.0),
                 item['Unit Price ($)'],
                 item_discount_share,
                 item_total,
@@ -850,12 +946,17 @@ elif role == "📊 Admin Dashboard":
         else:
             filtered_df = pd.DataFrame()
 
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         daily_revenue = filtered_df['total_price'].sum() if not filtered_df.empty else 0.0
         daily_items = filtered_df['quantity'].sum() if not filtered_df.empty else 0
         daily_discounts = (
             filtered_df['discount_amount'].sum()
             if not filtered_df.empty and 'discount_amount' in filtered_df.columns
+            else 0.0
+        )
+        daily_profit = (
+            (filtered_df['total_price'] - filtered_df['unit_cost'] * filtered_df['quantity']).sum()
+            if not filtered_df.empty and 'unit_cost' in filtered_df.columns
             else 0.0
         )
         top_product = (
@@ -866,32 +967,40 @@ elif role == "📊 Admin Dashboard":
         col1.metric("Revenue", f"${daily_revenue:.2f}")
         col2.metric("Items Sold", int(daily_items))
         col3.metric("Discounts Given", f"${daily_discounts:.2f}")
-        col4.metric("Top Moving Product", top_product)
+        col4.metric("Profit", f"${daily_profit:.2f}")
+        col5.metric("Top Moving Product", top_product)
 
         st.markdown(f"##### Sales Log — {selected_date}")
         if filtered_df.empty:
             st.caption("No sales recorded for this filter combination.")
         else:
-            st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+            display_df = filtered_df.copy()
+            if "unit_cost" in display_df.columns:
+                display_df["profit"] = display_df["total_price"] - (display_df["unit_cost"] * display_df["quantity"])
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "unit_cost": st.column_config.NumberColumn("Unit Cost", format="$%.2f"),
+                    "unit_price": st.column_config.NumberColumn("Unit Price", format="$%.2f"),
+                    "discount_amount": st.column_config.NumberColumn("Discount", format="$%.2f"),
+                    "total_price": st.column_config.NumberColumn("Total", format="$%.2f"),
+                    "profit": st.column_config.NumberColumn("Profit", format="$%.2f"),
+                },
+            )
 
-            excel_buffer = io.BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                sheet_name = f'Sales_{selected_date}'[:31]  # Excel sheet name limit
-                filtered_df.to_excel(writer, index=False, sheet_name=sheet_name)
-
-                worksheet = writer.sheets[sheet_name]
-                for col in worksheet.columns:
-                    max_len = max(len(str(cell.value or '')) for cell in col)
-                    col_letter = col[0].column_letter
-                    worksheet.column_dimensions[col_letter].width = max(max_len + 3, 12)
-
-            excel_data = excel_buffer.getvalue()
+            excel_data = build_formatted_sales_excel(filtered_df, f"Sales_{selected_date}")
 
             st.download_button(
                 label=f"📊 Download Excel Sales Report ({selected_date})",
                 data=excel_data,
                 file_name=f"Sales_Report_{selected_date}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.caption(
+                "Includes per-sale Unit Cost, Unit Price, Discount, Total, and Profit. "
+                "Sales recorded before this update will show $0.00 unit cost since that wasn't tracked yet."
             )
 
     with admin_tab2:
