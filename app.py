@@ -11,6 +11,14 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+# Google Sheets sync is optional — the app must keep working even if this
+# package isn't installed or nothing has been configured yet.
+try:
+    import requests
+    GSHEETS_LIB_AVAILABLE = True
+except ImportError:
+    GSHEETS_LIB_AVAILABLE = False
+
 st.set_page_config(page_title="POS & Inventory System", layout="wide", page_icon="🧾")
 
 # ---------------------------------------------------------
@@ -165,6 +173,88 @@ def build_formatted_sales_excel(df, sheet_name):
         worksheet.row_dimensions[1].height = 28
 
     return excel_buffer.getvalue()
+
+
+# ---------------------------------------------------------
+# GOOGLE SHEETS SYNC (free version — via a Google Apps Script Web App
+# deployed from inside the target sheet itself; no Google Cloud project,
+# service account, or billing needed).
+# ---------------------------------------------------------
+GSHEET_HEADERS = [
+    "Sale ID", "Timestamp", "Receipt Ref", "Product", "Qty",
+    "Unit Cost", "Unit Price", "Discount", "Total", "Profit",
+    "Payment Method", "Cashier",
+]
+
+
+def gsheet_is_configured():
+    """True only if the library is installed AND the Web App URL secret is set."""
+    if not GSHEETS_LIB_AVAILABLE:
+        return False
+    try:
+        return bool(st.secrets.get("gsheet_webapp_url"))
+    except Exception:
+        # st.secrets raises if no secrets.toml exists at all yet.
+        return False
+
+
+def gsheet_url():
+    """Link to actually open/view the sheet (separate from the Web App URL
+    used to push data to it)."""
+    try:
+        return st.secrets.get("gsheet_share_url") or None
+    except Exception:
+        return None
+
+
+def _rows_from_dataframe(df):
+    rows = []
+    for _, r in df.iterrows():
+        cost = float(r.get("unit_cost", 0) or 0)
+        qty = int(r.get("quantity", 0) or 0)
+        total = float(r.get("total_price", 0) or 0)
+        profit = total - (cost * qty)
+        rows.append([
+            str(int(r.get("id", 0))),
+            str(r.get("timestamp", "")),
+            str(r.get("receipt_id", "")),
+            str(r.get("product_name", "")),
+            qty,
+            cost,
+            float(r.get("unit_price", 0) or 0),
+            float(r.get("discount_amount", 0) or 0),
+            total,
+            profit,
+            str(r.get("payment_method", "")),
+            str(r.get("cashier", "")),
+        ])
+    return rows
+
+
+def sync_dataframe_to_gsheet(df):
+    """POST rows to the Apps Script Web App, which de-duplicates by Sale ID
+    on its side and appends whatever's new. Returns the number of rows
+    added, None if not configured, or False if the request failed."""
+    if not gsheet_is_configured():
+        return None
+    if df.empty:
+        return 0
+
+    payload = {
+        "secret": st.secrets.get("gsheet_webapp_secret", ""),
+        "headers": GSHEET_HEADERS,
+        "rows": _rows_from_dataframe(df),
+    }
+    try:
+        resp = requests.post(st.secrets["gsheet_webapp_url"], json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return False
+
+    if data.get("status") != "ok":
+        return False
+    return int(data.get("added", 0))
 
 
 def get_connection():
@@ -474,7 +564,20 @@ def _complete_transaction():
         cursor.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (item['Quantity'], item['id']))
 
     conn.commit()
+
+    # Grab the rows we just inserted (before closing) so we can push them to
+    # Google Sheets in the same shape as the Excel export.
+    new_sale_rows_df = None
+    if gsheet_is_configured():
+        cursor.execute("SELECT * FROM sales WHERE receipt_id = ?", (receipt_id,))
+        cols = [d[0] for d in cursor.description]
+        new_sale_rows_df = pd.DataFrame(cursor.fetchall(), columns=cols)
+
     conn.close()
+
+    if new_sale_rows_df is not None:
+        sync_result = sync_dataframe_to_gsheet(new_sale_rows_df)
+        st.session_state["gsheet_sync_status"] = sync_result  # int rows added, False on failure, or 0
 
     docx_bytes = generate_receipt_docx(
         receipt_id, st.session_state.active_cashier, pay_method, st.session_state.cart,
@@ -542,6 +645,11 @@ if role == "🛒 Cashier Terminal":
 
     if st.session_state.last_receipt:
         st.success(f"✅ Transaction completed. Reference: #{st.session_state.last_receipt['id']}")
+        sync_status = st.session_state.pop("gsheet_sync_status", None)
+        if sync_status is False:
+            st.caption("⚠️ Couldn't reach the Google Sheet for this sale — it's still saved locally. Use **Sync Now** on the Admin Dashboard to retry.")
+        elif isinstance(sync_status, int) and sync_status > 0:
+            st.caption("☁️ Synced to the shared Google Sheet.")
         rc_col1, rc_col2 = st.columns([2, 1])
         with rc_col1:
             st.download_button(
@@ -1002,6 +1110,38 @@ elif role == "📊 Admin Dashboard":
                 "Includes per-sale Unit Cost, Unit Price, Discount, Total, and Profit. "
                 "Sales recorded before this update will show $0.00 unit cost since that wasn't tracked yet."
             )
+
+            st.markdown("---")
+            st.markdown("###### ☁️ Google Sheets (online shared copy)")
+            if not GSHEETS_LIB_AVAILABLE:
+                st.info(
+                    "Google Sheets sync isn't available yet — add `requests` to requirements.txt and redeploy to enable it."
+                )
+            elif not gsheet_is_configured():
+                st.info(
+                    "Not connected yet. This uses a **free Google Apps Script Web App** — no Google Cloud project "
+                    "or billing needed. Once you add the Web App URL to your app's secrets, every completed sale "
+                    "will push here automatically, and you'll get a manual **Sync Now** button as a backup. "
+                    "Ask me for setup steps if you'd like."
+                )
+            else:
+                gs_col1, gs_col2 = st.columns([1, 1])
+                with gs_col1:
+                    sheet_link = gsheet_url()
+                    if sheet_link:
+                        st.link_button("🔗 Open Shared Google Sheet", sheet_link, use_container_width=True)
+                    else:
+                        st.caption("Add `gsheet_share_url` to secrets to show an Open link here.")
+                with gs_col2:
+                    if st.button("🔄 Sync Now", use_container_width=True, help="Push any rows from this filtered view that aren't in the sheet yet."):
+                        with st.spinner("Syncing to Google Sheets..."):
+                            result = sync_dataframe_to_gsheet(filtered_df)
+                        if result is False:
+                            st.error("Couldn't reach the Google Sheet. Check the Web App URL/deployment and try again.")
+                        elif result == 0:
+                            st.success("Already up to date — nothing new to sync.")
+                        else:
+                            st.success(f"Synced {result} row(s) to the Google Sheet.")
 
     with admin_tab2:
         st.markdown("##### Add Cashier Profile")
