@@ -19,6 +19,23 @@ try:
 except ImportError:
     GSHEETS_LIB_AVAILABLE = False
 
+# ============================================================
+# PASTE YOUR GOOGLE SHEET CONFIG HERE (between the quotes)
+# ------------------------------------------------------------
+# GSHEET_WEBAPP_URL   = the Apps Script Web App URL, must end in /exec
+# GSHEET_WEBAPP_SECRET = the same SHARED_SECRET you set inside the script
+# GSHEET_SHARE_URL   = the normal Google Sheet link (for the "Open" button)
+#
+# Note: since this file often ends up in a public/shared repo, anyone who
+# can see this code can also see these values. If that's a concern, use
+# Streamlit's secrets manager instead (Settings → Secrets on Streamlit
+# Cloud, or .streamlit/secrets.toml locally) — either way works, this file
+# checks secrets first and only falls back to the lines below.
+# ============================================================
+GSHEET_WEBAPP_URL = ""
+GSHEET_WEBAPP_SECRET = ""
+GSHEET_SHARE_URL = ""
+
 st.set_page_config(page_title="POS & Inventory System", layout="wide", page_icon="🧾")
 
 # ---------------------------------------------------------
@@ -187,24 +204,30 @@ GSHEET_HEADERS = [
 ]
 
 
+def _gsheet_config(secret_key, hardcoded_value):
+    """Prefer Streamlit secrets if set; otherwise fall back to the hardcoded
+    constants at the top of this file. Returns None if neither is set."""
+    try:
+        val = st.secrets.get(secret_key)
+        if val:
+            return val
+    except Exception:
+        pass  # st.secrets raises if no secrets.toml/secrets configured at all
+    return hardcoded_value or None
+
+
 def gsheet_is_configured():
-    """True only if the library is installed AND the Web App URL secret is set."""
+    """True only if the library is installed AND a Web App URL is set
+    (either via secrets or hardcoded at the top of this file)."""
     if not GSHEETS_LIB_AVAILABLE:
         return False
-    try:
-        return bool(st.secrets.get("gsheet_webapp_url"))
-    except Exception:
-        # st.secrets raises if no secrets.toml exists at all yet.
-        return False
+    return bool(_gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL))
 
 
 def gsheet_url():
     """Link to actually open/view the sheet (separate from the Web App URL
     used to push data to it)."""
-    try:
-        return st.secrets.get("gsheet_share_url") or None
-    except Exception:
-        return None
+    return _gsheet_config("gsheet_share_url", GSHEET_SHARE_URL)
 
 
 def _rows_from_dataframe(df):
@@ -246,11 +269,11 @@ def sync_dataframe_to_gsheet(df):
         return {"configured": True, "ok": True, "added": 0, "error": None}
 
     payload = {
-        "secret": st.secrets.get("gsheet_webapp_secret", ""),
+        "secret": _gsheet_config("gsheet_webapp_secret", GSHEET_WEBAPP_SECRET) or "",
         "headers": GSHEET_HEADERS,
         "rows": _rows_from_dataframe(df),
     }
-    url = st.secrets["gsheet_webapp_url"]
+    url = _gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL)
 
     try:
         resp = requests.post(url, json=payload, timeout=15)
