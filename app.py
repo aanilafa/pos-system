@@ -233,28 +233,53 @@ def _rows_from_dataframe(df):
 
 def sync_dataframe_to_gsheet(df):
     """POST rows to the Apps Script Web App, which de-duplicates by Sale ID
-    on its side and appends whatever's new. Returns the number of rows
-    added, None if not configured, or False if the request failed."""
+    on its side and appends whatever's new.
+
+    Returns a dict: {"configured": bool, "ok": bool, "added": int, "error": str|None}
+    The "error" message is meant to be shown to you (the admin) to make
+    debugging the Apps Script deployment fast, since "couldn't reach it" by
+    itself doesn't say why.
+    """
     if not gsheet_is_configured():
-        return None
+        return {"configured": False, "ok": False, "added": 0, "error": None}
     if df.empty:
-        return 0
+        return {"configured": True, "ok": True, "added": 0, "error": None}
 
     payload = {
         "secret": st.secrets.get("gsheet_webapp_secret", ""),
         "headers": GSHEET_HEADERS,
         "rows": _rows_from_dataframe(df),
     }
+    url = st.secrets["gsheet_webapp_url"]
+
     try:
-        resp = requests.post(st.secrets["gsheet_webapp_url"], json=payload, timeout=15)
-        resp.raise_for_status()
+        resp = requests.post(url, json=payload, timeout=15)
+    except requests.exceptions.RequestException as exc:
+        return {"configured": True, "ok": False, "added": 0, "error": f"Network error reaching the Web App: {exc}"}
+
+    if resp.status_code != 200:
+        snippet = resp.text[:200].replace("\n", " ")
+        return {
+            "configured": True, "ok": False, "added": 0,
+            "error": f"Web App returned HTTP {resp.status_code}. Response started with: {snippet!r}",
+        }
+
+    try:
         data = resp.json()
-    except Exception:
-        return False
+    except ValueError:
+        snippet = resp.text[:200].replace("\n", " ")
+        return {
+            "configured": True, "ok": False, "added": 0,
+            "error": (
+                "Web App didn't return JSON — this usually means the deployment's 'Who has access' isn't set to "
+                f"'Anyone', or gsheet_webapp_url is stale/wrong. Response started with: {snippet!r}"
+            ),
+        }
 
     if data.get("status") != "ok":
-        return False
-    return int(data.get("added", 0))
+        return {"configured": True, "ok": False, "added": 0, "error": data.get("message", "Unknown error from the Web App.")}
+
+    return {"configured": True, "ok": True, "added": int(data.get("added", 0)), "error": None}
 
 
 def get_connection():
@@ -577,7 +602,7 @@ def _complete_transaction():
 
     if new_sale_rows_df is not None:
         sync_result = sync_dataframe_to_gsheet(new_sale_rows_df)
-        st.session_state["gsheet_sync_status"] = sync_result  # int rows added, False on failure, or 0
+        st.session_state["gsheet_sync_status"] = sync_result
 
     docx_bytes = generate_receipt_docx(
         receipt_id, st.session_state.active_cashier, pay_method, st.session_state.cart,
@@ -646,9 +671,12 @@ if role == "🛒 Cashier Terminal":
     if st.session_state.last_receipt:
         st.success(f"✅ Transaction completed. Reference: #{st.session_state.last_receipt['id']}")
         sync_status = st.session_state.pop("gsheet_sync_status", None)
-        if sync_status is False:
-            st.caption("⚠️ Couldn't reach the Google Sheet for this sale — it's still saved locally. Use **Sync Now** on the Admin Dashboard to retry.")
-        elif isinstance(sync_status, int) and sync_status > 0:
+        if sync_status and sync_status.get("configured") and not sync_status.get("ok"):
+            st.caption(
+                f"⚠️ Couldn't sync this sale to Google Sheets ({sync_status.get('error')}). "
+                "It's still saved locally — use **Sync Now** on the Admin Dashboard to retry."
+            )
+        elif sync_status and sync_status.get("ok") and sync_status.get("added", 0) > 0:
             st.caption("☁️ Synced to the shared Google Sheet.")
         rc_col1, rc_col2 = st.columns([2, 1])
         with rc_col1:
@@ -1136,12 +1164,12 @@ elif role == "📊 Admin Dashboard":
                     if st.button("🔄 Sync Now", use_container_width=True, help="Push any rows from this filtered view that aren't in the sheet yet."):
                         with st.spinner("Syncing to Google Sheets..."):
                             result = sync_dataframe_to_gsheet(filtered_df)
-                        if result is False:
-                            st.error("Couldn't reach the Google Sheet. Check the Web App URL/deployment and try again.")
-                        elif result == 0:
+                        if not result["ok"]:
+                            st.error(f"Couldn't reach the Google Sheet: {result['error']}")
+                        elif result["added"] == 0:
                             st.success("Already up to date — nothing new to sync.")
                         else:
-                            st.success(f"Synced {result} row(s) to the Google Sheet.")
+                            st.success(f"Synced {result['added']} row(s) to the Google Sheet.")
 
     with admin_tab2:
         st.markdown("##### Add Cashier Profile")
