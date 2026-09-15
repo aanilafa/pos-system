@@ -32,7 +32,7 @@ except ImportError:
 # Cloud, or .streamlit/secrets.toml locally) — either way works, this file
 # checks secrets first and only falls back to the lines below.
 # ============================================================
-GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbzxjul5CfslAS-e8R1CqHYwvqa-7Ejlhud5e3JAULj71IixB7uJ2ZSEG_aCIIkQutk/exec"
+GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxtk6yTSHJG6PGy2ZzGA7oczM9bDm78-o-FDuy_tZZfi-Puoltms8KHqgRSt0-26dI/exec"
 GSHEET_WEBAPP_SECRET = "POS-SI-2026-9xK7mQ4vT8pL2"
 GSHEET_SHARE_URL = "https://docs.google.com/spreadsheets/d/1eokIRdiCSkEIkSSckMT6kMERMJDuA1i7iUIk6OWzqa8/edit?usp=sharing"
 
