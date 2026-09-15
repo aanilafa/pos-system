@@ -32,9 +32,9 @@ except ImportError:
 # Cloud, or .streamlit/secrets.toml locally) — either way works, this file
 # checks secrets first and only falls back to the lines below.
 # ============================================================
-GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxtk6yTSHJG6PGy2ZzGA7oczM9bDm78-o-FDuy_tZZfi-Puoltms8KHqgRSt0-26dI/exec"
+GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxtk6yTSHJG6Py2ZzGA7oczM9bDm78-oFDuy_TZFi-Puolm8sKHggRSt0-26dI/exec"
 GSHEET_WEBAPP_SECRET = "POS-SI-2026-9xK7mQ4vT8pL2"
-GSHEET_SHARE_URL = "https://docs.google.com/spreadsheets/d/1eokIRdiCSkEIkSSckMT6kMERMJDuA1i7iUIk6OWzqa8/edit?usp=sharing"
+GSHEET_SHARE_URL = "https://docs.google.com/spreadsheets/d/1eokIRdiCSkEIkSSCkMT6kMERMJDUA1i7iUIk60Wzqa8/edit?usp=sharing"
 
 st.set_page_config(page_title="POS & Inventory System", layout="wide", page_icon="🧾")
 
@@ -381,6 +381,241 @@ def sync_all_sales_to_gsheet():
     finally:
         conn.close()
     return sync_dataframe_to_gsheet(df, max_attempts=3)
+
+
+def clear_google_sheet(action="clear_sales", max_attempts=3):
+    """Request the Apps Script to remove sales rows from the online sheet.
+
+    Supported actions:
+      - ``clear_sales``: remove all sales rows but keep the header.
+      - ``clear_all``: legacy/full-reset action, also removes all sales rows.
+
+    The Apps Script must support the requested action. The header row is
+    preserved so the sheet is ready for the next sync.
+    """
+    if not gsheet_is_configured():
+        return {
+            "configured": False,
+            "ok": False,
+            "attempts": 0,
+            "error": "Google Sheets is not configured.",
+        }
+
+    if not GSHEETS_LIB_AVAILABLE:
+        return {
+            "configured": False,
+            "ok": False,
+            "attempts": 0,
+            "error": "The requests package is not installed.",
+        }
+
+    secret = _gsheet_config("gsheet_webapp_secret", GSHEET_WEBAPP_SECRET) or ""
+    url = _gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, must_be_url=True)
+    if not secret:
+        return {
+            "configured": True,
+            "ok": False,
+            "attempts": 0,
+            "error": "Google Sheets shared secret is missing.",
+        }
+
+    if action not in {"clear_sales", "clear_all"}:
+        return {
+            "configured": True,
+            "ok": False,
+            "attempts": 0,
+            "cleared": 0,
+            "error": f"Unsupported Google Sheets clear action: {action}",
+        }
+
+    payload = {"secret": secret, "action": action}
+    attempts = max(1, int(max_attempts))
+    last_error = "Unknown Google Sheets clear error."
+
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=20)
+        except requests.exceptions.RequestException as exc:
+            last_error = f"Network error reaching the Web App: {exc}"
+        else:
+            if resp.status_code != 200:
+                snippet = resp.text[:300].replace("\n", " ")
+                last_error = (
+                    f"Web App returned HTTP {resp.status_code}. "
+                    f"Response started with: {snippet!r}"
+                )
+            else:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    snippet = resp.text[:300].replace("\n", " ")
+                    last_error = (
+                        "Web App didn't return JSON while clearing Google Sheets. "
+                        f"Response started with: {snippet!r}"
+                    )
+                else:
+                    if data.get("status") == "ok":
+                        return {
+                            "configured": True,
+                            "ok": True,
+                            "attempts": attempt,
+                            "cleared": int(data.get("cleared", 0)),
+                            "error": None,
+                        }
+                    last_error = data.get("message", "Unknown error from the Web App.")
+
+        if attempt < attempts:
+            import time
+            time.sleep(2 ** (attempt - 1))
+
+    return {
+        "configured": True,
+        "ok": False,
+        "attempts": attempts,
+        "cleared": 0,
+        "error": last_error,
+    }
+
+
+def clear_sales_local():
+    """Permanently remove all local sales history while preserving products and cashiers."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM sales")
+        cursor.execute("DELETE FROM sqlite_sequence WHERE name = 'sales'")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def clear_inventory_local():
+    """Permanently remove all products/stock while preserving sales and cashiers."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM products")
+        cursor.execute("DELETE FROM sqlite_sequence WHERE name = 'products'")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def clear_local_data():
+    """Permanently remove all POS data while preserving the database schema."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM sales")
+        cursor.execute("DELETE FROM products")
+        cursor.execute("DELETE FROM cashiers")
+        cursor.execute("DELETE FROM sqlite_sequence WHERE name IN ('sales', 'products', 'cashiers')")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def clear_sales_everywhere():
+    """Clear sales from Google Sheets first, then delete local sales history."""
+    if gsheet_is_configured():
+        cloud_result = clear_google_sheet(action="clear_sales", max_attempts=3)
+        if not cloud_result.get("ok"):
+            return {
+                "ok": False,
+                "cloud_ok": False,
+                "error": "Google Sheet sales were not cleared, so local sales history was kept safe. "
+                         + (cloud_result.get("error") or "Unknown Google Sheets error."),
+            }
+    else:
+        cloud_result = {"ok": True, "cleared": 0, "skipped": True}
+
+    try:
+        clear_sales_local()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "cloud_ok": True,
+            "error": f"Google Sheet sales were cleared, but local sales could not be cleared: {exc}",
+        }
+
+    return {
+        "ok": True,
+        "cloud_ok": True,
+        "cloud_cleared": int(cloud_result.get("cleared", 0) or 0),
+        "error": None,
+    }
+
+
+def clear_inventory():
+    """Clear only local products and stock; sales and cashiers are preserved."""
+    try:
+        clear_inventory_local()
+        return {"ok": True, "error": None}
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not clear inventory: {exc}"}
+
+
+def clear_everything():
+    """Clear both the online Google Sheet and the local POS database.
+
+    Local data is only deleted after the Google Sheet clear succeeds, preventing
+    the most dangerous partial-clear case.
+    """
+    if gsheet_is_configured():
+        cloud_result = clear_google_sheet(max_attempts=3)
+        if not cloud_result.get("ok"):
+            return {
+                "ok": False,
+                "cloud_ok": False,
+                "error": "Google Sheet was not cleared, so local POS data was kept safe. "
+                         + (cloud_result.get("error") or "Unknown Google Sheets error."),
+            }
+    else:
+        cloud_result = {"ok": True, "cleared": 0, "skipped": True}
+
+    try:
+        clear_local_data()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "cloud_ok": True,
+            "error": f"Google Sheet was cleared, but the local database could not be cleared: {exc}",
+        }
+
+    return {
+        "ok": True,
+        "cloud_ok": True,
+        "cloud_cleared": int(cloud_result.get("cleared", 0) or 0),
+        "error": None,
+    }
+
+
+def reset_runtime_state_after_clear():
+    """Reset Streamlit state so no old cart/report/receipt data remains visible."""
+    st.session_state.cart = []
+    st.session_state.selected_category = "All"
+    st.session_state.active_cashier = ""
+    st.session_state.last_receipt = None
+    st.session_state.confirm_delete_product = None
+    st.session_state.gsheet_last_manual_sync = None
+    st.session_state.pop("gsheet_sync_status", None)
+    st.session_state.pop("checkout_feedback", None)
+    st.session_state.pop("add_product_feedback", None)
+    st.session_state["clear_everything_confirm"] = ""
+    st.session_state["show_clear_everything_confirm"] = False
+    st.session_state["clear_sales_confirm"] = ""
+    st.session_state["show_clear_sales_confirm"] = False
+    st.session_state["clear_inventory_confirm"] = ""
+    st.session_state["show_clear_inventory_confirm"] = False
 
 
 def get_connection():
@@ -732,6 +967,18 @@ if "confirm_delete_product" not in st.session_state:
     st.session_state.confirm_delete_product = None
 if "gsheet_last_manual_sync" not in st.session_state:
     st.session_state.gsheet_last_manual_sync = None
+if "show_clear_everything_confirm" not in st.session_state:
+    st.session_state.show_clear_everything_confirm = False
+if "clear_everything_confirm" not in st.session_state:
+    st.session_state.clear_everything_confirm = ""
+if "show_clear_sales_confirm" not in st.session_state:
+    st.session_state.show_clear_sales_confirm = False
+if "clear_sales_confirm" not in st.session_state:
+    st.session_state.clear_sales_confirm = ""
+if "show_clear_inventory_confirm" not in st.session_state:
+    st.session_state.show_clear_inventory_confirm = False
+if "clear_inventory_confirm" not in st.session_state:
+    st.session_state.clear_inventory_confirm = ""
 
 # ---------------------------------------------------------
 # SIDEBAR
@@ -1328,6 +1575,177 @@ elif role == "📊 Admin Dashboard":
                             f"Last manual sync: {last_manual_sync.get('added', 0)} new row(s) added; "
                             f"{last_manual_sync.get('attempts', 1)} attempt(s)."
                         )
+
+        # -----------------------------------------------------
+        # DANGER ZONE: DATA CLEAR CONTROLS
+        # -----------------------------------------------------
+        st.markdown("---")
+        st.markdown("### ⚠️ Danger Zone")
+        st.warning(
+            "These controls permanently delete data. **Clear Sales Only** removes sales history "
+            "from both the POS and the Google Sales Log while keeping products and cashiers. "
+            "**Clear Inventory Only** removes products and stock while keeping sales and cashiers. "
+            "**Clear Everything** removes all POS data and all Google Sales Log rows. These actions cannot be undone."
+        )
+
+        danger_col1, danger_col2, danger_col3 = st.columns(3)
+
+        with danger_col1:
+            st.markdown("#### 🧾 Clear Sales Only")
+            st.caption("Deletes all sales history locally and from Google Sheets. Products and cashiers remain.")
+            if not st.session_state.show_clear_sales_confirm:
+                if st.button(
+                    "🧾 Clear Sales Only",
+                    type="secondary",
+                    use_container_width=True,
+                    key="open_clear_sales",
+                    help="Permanently delete all sales history from the POS and Google Sales Log.",
+                ):
+                    st.session_state.show_clear_sales_confirm = True
+                    st.session_state.clear_sales_confirm = ""
+                    st.rerun()
+            else:
+                st.error("Type CLEAR SALES to confirm permanent deletion of all sales history.")
+                st.text_input(
+                    "Confirmation",
+                    key="clear_sales_confirm",
+                    placeholder="CLEAR SALES",
+                    label_visibility="collapsed",
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    confirm_sales = st.button(
+                        "Delete Sales",
+                        type="primary",
+                        use_container_width=True,
+                        key="confirm_clear_sales",
+                        disabled=st.session_state.clear_sales_confirm != "CLEAR SALES",
+                    )
+                with c2:
+                    cancel_sales = st.button("Cancel", use_container_width=True, key="cancel_clear_sales")
+
+                if cancel_sales:
+                    st.session_state.show_clear_sales_confirm = False
+                    st.session_state.clear_sales_confirm = ""
+                    st.rerun()
+
+                if confirm_sales:
+                    with st.spinner("Clearing sales history from POS and Google Sheets..."):
+                        result = clear_sales_everywhere()
+                    if result.get("ok"):
+                        reset_runtime_state_after_clear()
+                        st.success(
+                            f"✅ Sales history cleared. Google Sales Log rows removed: "
+                            f"{result.get('cloud_cleared', 0)}."
+                        )
+                        st.rerun()
+                    else:
+                        st.error(result.get("error") or "Could not clear sales history.")
+
+        with danger_col2:
+            st.markdown("#### 📦 Clear Inventory Only")
+            st.caption("Deletes all products and stock. Sales history and cashiers remain.")
+            if not st.session_state.show_clear_inventory_confirm:
+                if st.button(
+                    "📦 Clear Inventory Only",
+                    type="secondary",
+                    use_container_width=True,
+                    key="open_clear_inventory",
+                    help="Permanently delete all products and stock while preserving sales and cashiers.",
+                ):
+                    st.session_state.show_clear_inventory_confirm = True
+                    st.session_state.clear_inventory_confirm = ""
+                    st.rerun()
+            else:
+                st.error("Type CLEAR INVENTORY to confirm permanent deletion of all products and stock.")
+                st.text_input(
+                    "Confirmation",
+                    key="clear_inventory_confirm",
+                    placeholder="CLEAR INVENTORY",
+                    label_visibility="collapsed",
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    confirm_inventory = st.button(
+                        "Delete Inventory",
+                        type="primary",
+                        use_container_width=True,
+                        key="confirm_clear_inventory",
+                        disabled=st.session_state.clear_inventory_confirm != "CLEAR INVENTORY",
+                    )
+                with c2:
+                    cancel_inventory = st.button("Cancel", use_container_width=True, key="cancel_clear_inventory")
+
+                if cancel_inventory:
+                    st.session_state.show_clear_inventory_confirm = False
+                    st.session_state.clear_inventory_confirm = ""
+                    st.rerun()
+
+                if confirm_inventory:
+                    with st.spinner("Clearing inventory..."):
+                        result = clear_inventory()
+                    if result.get("ok"):
+                        st.session_state.cart = []
+                        st.session_state.selected_category = "All"
+                        st.session_state.clear_inventory_confirm = ""
+                        st.session_state.show_clear_inventory_confirm = False
+                        st.success("✅ Inventory cleared. All products and stock were removed. Sales and cashiers were kept.")
+                        st.rerun()
+                    else:
+                        st.error(result.get("error") or "Could not clear inventory.")
+
+        with danger_col3:
+            st.markdown("#### 🗑️ Clear Everything")
+            st.caption("Deletes products, stock, sales, cashiers, and Google Sales Log rows.")
+            if not st.session_state.show_clear_everything_confirm:
+                if st.button(
+                    "🗑️ Clear Everything",
+                    type="secondary",
+                    use_container_width=True,
+                    key="open_clear_everything",
+                    help="Permanently delete all POS data and all Google Sheets sales rows.",
+                ):
+                    st.session_state.show_clear_everything_confirm = True
+                    st.session_state.clear_everything_confirm = ""
+                    st.rerun()
+            else:
+                st.error("Type CLEAR EVERYTHING to confirm permanent deletion of all POS data and Google sales rows.")
+                st.text_input(
+                    "Confirmation",
+                    key="clear_everything_confirm",
+                    placeholder="CLEAR EVERYTHING",
+                    label_visibility="collapsed",
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    confirm_clear = st.button(
+                        "Permanently Clear Everything",
+                        type="primary",
+                        use_container_width=True,
+                        key="confirm_clear_everything",
+                        disabled=st.session_state.clear_everything_confirm != "CLEAR EVERYTHING",
+                    )
+                with c2:
+                    cancel_clear = st.button("Cancel", use_container_width=True, key="cancel_clear_everything")
+
+                if cancel_clear:
+                    st.session_state.show_clear_everything_confirm = False
+                    st.session_state.clear_everything_confirm = ""
+                    st.rerun()
+
+                if confirm_clear:
+                    with st.spinner("Clearing local POS data and Google Sheets..."):
+                        clear_result = clear_everything()
+
+                    if clear_result.get("ok"):
+                        reset_runtime_state_after_clear()
+                        st.success(
+                            "✅ Everything has been cleared successfully. Products, stock, sales history, "
+                            "cashiers, and Google Sheets sale rows have been removed."
+                        )
+                        st.rerun()
+                    else:
+                        st.error(clear_result.get("error") or "Could not clear everything.")
 
     with admin_tab2:
         st.markdown("##### Add Cashier Profile")
