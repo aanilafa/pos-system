@@ -204,30 +204,49 @@ GSHEET_HEADERS = [
 ]
 
 
-def _gsheet_config(secret_key, hardcoded_value):
+def _looks_like_url(value):
+    """Guard against placeholder text (e.g. someone pasted the instruction
+    'the web app URL you just copied' instead of the real link) being treated
+    as a real URL."""
+    return isinstance(value, str) and value.strip().startswith(("https://", "http://"))
+
+
+def _gsheet_config(secret_key, hardcoded_value, must_be_url=False):
     """Prefer Streamlit secrets if set; otherwise fall back to the hardcoded
-    constants at the top of this file. Returns None if neither is set."""
+    constants at the top of this file. Returns None if neither is usable.
+
+    When must_be_url is True, a value that isn't an http(s) link is treated as
+    unset, so leftover placeholder text in secrets doesn't silently override a
+    correctly-filled-in hardcoded URL."""
+    candidates = []
     try:
-        val = st.secrets.get(secret_key)
-        if val:
-            return val
+        candidates.append(st.secrets.get(secret_key))
     except Exception:
         pass  # st.secrets raises if no secrets.toml/secrets configured at all
-    return hardcoded_value or None
+    candidates.append(hardcoded_value)
+
+    for val in candidates:
+        if not val or not str(val).strip():
+            continue
+        val = str(val).strip()
+        if must_be_url and not _looks_like_url(val):
+            continue
+        return val
+    return None
 
 
 def gsheet_is_configured():
-    """True only if the library is installed AND a Web App URL is set
+    """True only if the library is installed AND a usable Web App URL is set
     (either via secrets or hardcoded at the top of this file)."""
     if not GSHEETS_LIB_AVAILABLE:
         return False
-    return bool(_gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL))
+    return bool(_gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, must_be_url=True))
 
 
 def gsheet_url():
     """Link to actually open/view the sheet (separate from the Web App URL
     used to push data to it)."""
-    return _gsheet_config("gsheet_share_url", GSHEET_SHARE_URL)
+    return _gsheet_config("gsheet_share_url", GSHEET_SHARE_URL, must_be_url=True)
 
 
 def _rows_from_dataframe(df):
@@ -273,7 +292,7 @@ def sync_dataframe_to_gsheet(df):
         "headers": GSHEET_HEADERS,
         "rows": _rows_from_dataframe(df),
     }
-    url = _gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL)
+    url = _gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, must_be_url=True)
 
     try:
         resp = requests.post(url, json=payload, timeout=15)
@@ -914,37 +933,159 @@ elif role == "📦 Stock Inventory":
     df_products = pd.read_sql_query("SELECT * FROM products", conn)
     conn.close()
 
-    st.markdown("##### Current Stock Levels")
-    if not df_products.empty:
-        df_display = df_products.copy()
-        df_display["Status"] = df_display["stock"].apply(
-            lambda x: "Low Stock" if 0 < x <= 3 else ("Out of Stock" if x <= 0 else "In Stock")
-        )
-        df_display = df_display.rename(columns={
-            "cost_price": "Unit Cost",
-            "price": "Selling Price",
-            "variant_label": "Price Tier / Variant",
-        })
-        df_display["Margin"] = df_display["Selling Price"] - df_display["Unit Cost"]
-        column_order = [c for c in ["id", "name", "Price Tier / Variant", "category", "Unit Cost", "Selling Price", "Margin", "stock", "Status"] if c in df_display.columns]
-        st.dataframe(
-            df_display[column_order],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
-                "Selling Price": st.column_config.NumberColumn(format="$%.2f"),
-                "Margin": st.column_config.NumberColumn(format="$%.2f"),
-            },
-        )
-    else:
-        st.info("No items found in stock database yet.")
+    inv_main_list, inv_main_add = st.tabs(["📋 Product List & Manage", "➕ Add Product"])
 
-    st.divider()
+    # =========================================================
+    # SUB-INTERFACE 1: LISTING + ADMIN MANAGEMENT (edit/delete)
+    # =========================================================
+    with inv_main_list:
+        st.markdown("##### Current Stock Levels")
+        if not df_products.empty:
+            df_display = df_products.copy()
+            df_display["Status"] = df_display["stock"].apply(
+                lambda x: "Low Stock" if 0 < x <= 3 else ("Out of Stock" if x <= 0 else "In Stock")
+            )
+            df_display = df_display.rename(columns={
+                "cost_price": "Unit Cost",
+                "price": "Selling Price",
+                "variant_label": "Price Tier / Variant",
+            })
+            df_display["Margin"] = df_display["Selling Price"] - df_display["Unit Cost"]
+            column_order = [c for c in ["id", "name", "Price Tier / Variant", "category", "Unit Cost", "Selling Price", "Margin", "stock", "Status"] if c in df_display.columns]
 
-    inv_tab1, inv_tab2, inv_tab3 = st.tabs(["➕ Add Product", "✏️ Edit Product", "🗑️ Delete Product"])
+            # Quick filters so the list stays usable as the catalog grows.
+            lf_col1, lf_col2 = st.columns([2, 1])
+            with lf_col1:
+                list_search = st.text_input("🔍 Search products", placeholder="Filter by name...", key="inv_list_search")
+            with lf_col2:
+                list_category = st.selectbox("Category", ["All"] + CATEGORIES, key="inv_list_cat")
 
-    with inv_tab1:
+            view_df = df_display[column_order].copy()
+            if list_search:
+                view_df = view_df[view_df["name"].str.contains(list_search, case=False, regex=False)]
+            if list_category != "All":
+                view_df = view_df[view_df["category"] == list_category]
+
+            total_items = int(df_display["stock"].sum())
+            stock_value = float((df_display["Unit Cost"] * df_display["stock"]).sum())
+            low_or_out = int((df_display["stock"] <= 3).sum())
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Product Lines", len(df_display))
+            m2.metric("Total Units in Stock", total_items)
+            m3.metric("Low / Out of Stock", low_or_out)
+            st.caption(f"Stock value at cost: ${stock_value:,.2f}")
+
+            if view_df.empty:
+                st.caption("No products match this filter.")
+            else:
+                st.dataframe(
+                    view_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
+                        "Selling Price": st.column_config.NumberColumn(format="$%.2f"),
+                        "Margin": st.column_config.NumberColumn(format="$%.2f"),
+                    },
+                )
+
+            st.divider()
+            st.markdown("##### Manage a Product")
+            manage_edit, manage_delete = st.tabs(["✏️ Edit Product", "🗑️ Delete Product"])
+        else:
+            st.info("No items found in stock database yet. Use the **Add Product** tab to create your first item.")
+            manage_edit, manage_delete = None, None
+
+        if manage_edit is not None:
+            with manage_edit:
+                df_products["_label"] = df_products.apply(format_product_label, axis=1)
+                label_to_id = dict(zip(df_products["_label"], df_products["id"]))
+
+                selected_label = st.selectbox("Select Product", df_products["_label"].tolist(), key="edit_select_label")
+                current_item = df_products[df_products["id"] == label_to_id[selected_label]].iloc[0]
+                pid = int(current_item["id"])
+                existing_cost = float(current_item.get("cost_price", 0.0) or 0.0)
+                existing_price = float(current_item["price"])
+                existing_markup = max(0.0, existing_price - existing_cost)
+
+                # Key widgets by product id so switching the selected product
+                # resets the fields to that product's own values.
+                edit_name = st.text_input("Product Name", value=current_item["name"], key=f"edit_name_{pid}")
+                edit_variant = st.text_input(
+                    "Price Tier / Variant Label (optional)",
+                    value=str(current_item.get("variant_label") or ""),
+                    placeholder="e.g. Retail, Wholesale, Premium",
+                    key=f"edit_variant_{pid}",
+                )
+                edit_cat = st.selectbox(
+                    "Category", CATEGORIES, index=CATEGORIES.index(current_item["category"]), key=f"edit_cat_{pid}"
+                )
+                edit_cost_col, edit_markup_col, edit_price_col = st.columns(3)
+                with edit_cost_col:
+                    edit_cost = st.number_input(
+                        "Unit Cost ($)", min_value=0.0, value=existing_cost, format="%.2f", key=f"edit_cost_{pid}"
+                    )
+                with edit_markup_col:
+                    edit_markup = st.number_input(
+                        "Markup ($)", min_value=0.0, value=existing_markup, format="%.2f", key=f"edit_markup_{pid}"
+                    )
+                edit_price = edit_cost + edit_markup
+                with edit_price_col:
+                    st.metric("Selling Price", f"${edit_price:.2f}")
+                edit_stock = st.number_input(
+                    "Exact Stock Count", min_value=0, value=int(current_item["stock"]), step=1, key=f"edit_stock_{pid}"
+                )
+                st.caption("This sets the **exact** stock count (overwrite), unlike Add Product which restocks additively.")
+
+                if st.button("Update Product", type="primary"):
+                    if not edit_name.strip():
+                        st.error("Product name cannot be empty.")
+                    else:
+                        conn = get_connection()
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "UPDATE products SET name = ?, variant_label = ?, category = ?, cost_price = ?, price = ?, stock = ? WHERE id = ?",
+                            (edit_name.strip(), edit_variant.strip(), edit_cat, edit_cost, edit_price, edit_stock, pid),
+                        )
+                        conn.commit()
+                        conn.close()
+                        st.success(f"Updated product details for '{edit_name}'.")
+                        st.rerun()
+
+            with manage_delete:
+                df_products["_label"] = df_products.apply(format_product_label, axis=1)
+                label_to_id = dict(zip(df_products["_label"], df_products["id"]))
+
+                delete_label = st.selectbox("Select Product to Remove", df_products["_label"].tolist(), key="del_select")
+                delete_prod_id = label_to_id[delete_label]
+
+                if st.session_state.confirm_delete_product != delete_prod_id:
+                    if st.button("🗑️ Delete Product", type="secondary"):
+                        st.session_state.confirm_delete_product = delete_prod_id
+                        st.rerun()
+                else:
+                    st.warning(f"Are you sure you want to permanently delete **{delete_label}**? This cannot be undone.")
+                    conf_col1, conf_col2 = st.columns(2)
+                    with conf_col1:
+                        if st.button("Yes, delete it", type="primary", use_container_width=True):
+                            conn = get_connection()
+                            cursor = conn.cursor()
+                            cursor.execute("DELETE FROM products WHERE id = ?", (int(delete_prod_id),))
+                            conn.commit()
+                            conn.close()
+                            st.session_state.confirm_delete_product = None
+                            st.success(f"Removed '{delete_label}' from inventory.")
+                            st.rerun()
+                    with conf_col2:
+                        if st.button("Cancel", use_container_width=True):
+                            st.session_state.confirm_delete_product = None
+                            st.rerun()
+
+    # =========================================================
+    # SUB-INTERFACE 2: ADD NEW PRODUCT
+    # =========================================================
+    with inv_main_add:
+        st.markdown("##### Add a New Product")
         st.caption("Enter what you pay (Unit Cost) and how much to add on top (Markup) — the Selling Price is calculated for you.")
         st.text_input("Product Name", key="add_p_name")
         st.text_input(
@@ -976,98 +1117,6 @@ elif role == "📦 Stock Inventory":
         if feedback:
             kind, message = feedback
             getattr(st, kind)(message)
-
-    with inv_tab2:
-        if df_products.empty:
-            st.caption("No products to edit yet.")
-        else:
-            df_products["_label"] = df_products.apply(format_product_label, axis=1)
-            label_to_id = dict(zip(df_products["_label"], df_products["id"]))
-
-            selected_label = st.selectbox("Select Product", df_products["_label"].tolist(), key="edit_select_label")
-            current_item = df_products[df_products["id"] == label_to_id[selected_label]].iloc[0]
-            pid = int(current_item["id"])
-            existing_cost = float(current_item.get("cost_price", 0.0) or 0.0)
-            existing_price = float(current_item["price"])
-            existing_markup = max(0.0, existing_price - existing_cost)
-
-            # Key widgets by product id so switching the selected product
-            # resets the fields to that product's own values.
-            edit_name = st.text_input("Product Name", value=current_item["name"], key=f"edit_name_{pid}")
-            edit_variant = st.text_input(
-                "Price Tier / Variant Label (optional)",
-                value=str(current_item.get("variant_label") or ""),
-                placeholder="e.g. Retail, Wholesale, Premium",
-                key=f"edit_variant_{pid}",
-            )
-            edit_cat = st.selectbox(
-                "Category", CATEGORIES, index=CATEGORIES.index(current_item["category"]), key=f"edit_cat_{pid}"
-            )
-            edit_cost_col, edit_markup_col, edit_price_col = st.columns(3)
-            with edit_cost_col:
-                edit_cost = st.number_input(
-                    "Unit Cost ($)", min_value=0.0, value=existing_cost, format="%.2f", key=f"edit_cost_{pid}"
-                )
-            with edit_markup_col:
-                edit_markup = st.number_input(
-                    "Markup ($)", min_value=0.0, value=existing_markup, format="%.2f", key=f"edit_markup_{pid}"
-                )
-            edit_price = edit_cost + edit_markup
-            with edit_price_col:
-                st.metric("Selling Price", f"${edit_price:.2f}")
-            edit_stock = st.number_input(
-                "Exact Stock Count", min_value=0, value=int(current_item["stock"]), step=1, key=f"edit_stock_{pid}"
-            )
-            st.caption("This sets the **exact** stock count (overwrite), unlike Add Product which restocks additively.")
-
-            update_submit = st.button("Update Product", type="primary")
-
-            if update_submit:
-                if not edit_name.strip():
-                    st.error("Product name cannot be empty.")
-                else:
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "UPDATE products SET name = ?, variant_label = ?, category = ?, cost_price = ?, price = ?, stock = ? WHERE id = ?",
-                        (edit_name.strip(), edit_variant.strip(), edit_cat, edit_cost, edit_price, edit_stock, pid),
-                    )
-                    conn.commit()
-                    conn.close()
-                    st.success(f"Updated product details for '{edit_name}'.")
-                    st.rerun()
-
-    with inv_tab3:
-        if df_products.empty:
-            st.caption("No products to delete yet.")
-        else:
-            df_products["_label"] = df_products.apply(format_product_label, axis=1)
-            label_to_id = dict(zip(df_products["_label"], df_products["id"]))
-
-            delete_label = st.selectbox("Select Product to Remove", df_products["_label"].tolist(), key="del_select")
-            delete_prod_id = label_to_id[delete_label]
-
-            if st.session_state.confirm_delete_product != delete_prod_id:
-                if st.button("🗑️ Delete Product", type="secondary"):
-                    st.session_state.confirm_delete_product = delete_prod_id
-                    st.rerun()
-            else:
-                st.warning(f"Are you sure you want to permanently delete **{delete_label}**? This cannot be undone.")
-                conf_col1, conf_col2 = st.columns(2)
-                with conf_col1:
-                    if st.button("Yes, delete it", type="primary", use_container_width=True):
-                        conn = get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute("DELETE FROM products WHERE id = ?", (int(delete_prod_id),))
-                        conn.commit()
-                        conn.close()
-                        st.session_state.confirm_delete_product = None
-                        st.success(f"Removed '{delete_label}' from inventory.")
-                        st.rerun()
-                with conf_col2:
-                    if st.button("Cancel", use_container_width=True):
-                        st.session_state.confirm_delete_product = None
-                        st.rerun()
 
 # ---------------------------------------------------------
 # VIEW 3: ADMIN DASHBOARD & REPORTS
