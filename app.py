@@ -34,7 +34,7 @@ except ImportError:
 # ============================================================
 GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxtk6yTSHJG6PGy2ZzGA7oczM9bDm78-o-FDuy_tZZfi-Puoltms8KHqgRSt0-26dI/exec"
 GSHEET_WEBAPP_SECRET = "POS-SI-2026-9xK7mQ4vT8pL2"
-GSHEET_SHARE_URL = "https://docs.google.com/spreadsheets/d/1eokIRdiCSkEIkSSckMT6kMERMJDuA1i7iUIk6OWzqa8/edit?gid=1843822426#gid=1843822426"
+GSHEET_SHARE_URL = "https://docs.google.com/spreadsheets/d/1eokIRdiCSkEIkSSCkMT6kMERMJDUA1i7iUIk60Wzqa8/edit?usp=sharing"
 
 st.set_page_config(page_title="POS & Inventory System", layout="wide", page_icon="🧾")
 
@@ -201,6 +201,11 @@ GSHEET_HEADERS = [
     "Sale ID", "Timestamp", "Receipt Ref", "Product", "Qty",
     "Unit Cost", "Unit Price", "Discount", "Total", "Profit",
     "Payment Method", "Cashier",
+]
+
+GSHEET_INVENTORY_HEADERS = [
+    "Product ID", "Product", "Price Tier / Variant", "Category",
+    "Unit Cost", "Selling Price", "Margin", "Stock", "Status",
 ]
 
 
@@ -383,15 +388,120 @@ def sync_all_sales_to_gsheet():
     return sync_dataframe_to_gsheet(df, max_attempts=3)
 
 
+def _rows_from_inventory_dataframe(df):
+    """Convert the local products dataframe into the Google Inventory Log shape."""
+    rows = []
+    if df is None or df.empty:
+        return rows
+
+    for _, r in df.iterrows():
+        stock = int(r.get("stock", 0) or 0)
+        if stock <= 0:
+            status = "Out of Stock"
+        elif stock <= 3:
+            status = "Low Stock"
+        else:
+            status = "In Stock"
+
+        cost = float(r.get("cost_price", 0) or 0)
+        price = float(r.get("price", 0) or 0)
+        rows.append([
+            str(int(r.get("id", 0))),
+            str(r.get("name", "")),
+            str(r.get("variant_label", "") or ""),
+            str(r.get("category", "")),
+            cost,
+            price,
+            price - cost,
+            stock,
+            status,
+        ])
+    return rows
+
+
+def sync_inventory_to_gsheet(max_attempts=3):
+    """Mirror the complete local inventory into a dedicated Google Inventory Log tab.
+
+    The Apps Script replaces the data rows in that tab on each successful sync,
+    so edits, restocks, deletions and stock changes are reflected accurately.
+    The header row is preserved.
+    """
+    if not gsheet_is_configured():
+        return {"configured": False, "ok": False, "updated": 0, "attempts": 0, "error": "Google Sheets is not configured."}
+
+    if not GSHEETS_LIB_AVAILABLE:
+        return {"configured": False, "ok": False, "updated": 0, "attempts": 0, "error": "The requests package is not installed."}
+
+    secret = _gsheet_config("gsheet_webapp_secret", GSHEET_WEBAPP_SECRET) or ""
+    url = _gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, must_be_url=True)
+    if not secret:
+        return {"configured": True, "ok": False, "updated": 0, "attempts": 0, "error": "Google Sheets shared secret is missing."}
+
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query("SELECT * FROM products ORDER BY id ASC", conn)
+    finally:
+        conn.close()
+
+    payload = {
+        "secret": secret,
+        "action": "sync_inventory",
+        "headers": GSHEET_INVENTORY_HEADERS,
+        "rows": _rows_from_inventory_dataframe(df),
+    }
+
+    attempts = max(1, int(max_attempts))
+    last_error = "Unknown Google Inventory sync error."
+
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=20)
+        except requests.exceptions.RequestException as exc:
+            last_error = f"Network error reaching the Web App: {exc}"
+        else:
+            if resp.status_code != 200:
+                snippet = resp.text[:300].replace("\n", " ")
+                last_error = f"Web App returned HTTP {resp.status_code}. Response started with: {snippet!r}"
+            else:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    snippet = resp.text[:300].replace("\n", " ")
+                    last_error = f"Web App didn't return JSON while syncing inventory. Response started with: {snippet!r}"
+                else:
+                    if data.get("status") == "ok":
+                        return {
+                            "configured": True,
+                            "ok": True,
+                            "updated": int(data.get("updated", 0)),
+                            "attempts": attempt,
+                            "error": None,
+                        }
+                    last_error = data.get("message", "Unknown error from the Web App.")
+
+        if attempt < attempts:
+            import time
+            time.sleep(2 ** (attempt - 1))
+
+    return {
+        "configured": True,
+        "ok": False,
+        "updated": 0,
+        "attempts": attempts,
+        "error": last_error,
+    }
+
+
 def clear_google_sheet(action="clear_sales", max_attempts=3):
     """Request the Apps Script to remove sales rows from the online sheet.
 
     Supported actions:
-      - ``clear_sales``: remove all sales rows but keep the header.
-      - ``clear_all``: legacy/full-reset action, also removes all sales rows.
+      - ``clear_sales``: remove all Sales Log rows but keep its header.
+      - ``clear_inventory``: remove all Inventory Log rows but keep its header.
+      - ``clear_all``: remove both Sales Log and Inventory Log data rows.
 
-    The Apps Script must support the requested action. The header row is
-    preserved so the sheet is ready for the next sync.
+    The Apps Script must support the requested action. Header rows are
+    preserved so both tabs are ready for the next sync.
     """
     if not gsheet_is_configured():
         return {
@@ -419,7 +529,7 @@ def clear_google_sheet(action="clear_sales", max_attempts=3):
             "error": "Google Sheets shared secret is missing.",
         }
 
-    if action not in {"clear_sales", "clear_all"}:
+    if action not in {"clear_sales", "clear_inventory", "clear_all"}:
         return {
             "configured": True,
             "ok": False,
@@ -556,12 +666,38 @@ def clear_sales_everywhere():
 
 
 def clear_inventory():
-    """Clear only local products and stock; sales and cashiers are preserved."""
+    """Clear inventory from Google first, then local products/stock.
+
+    Sales history and cashiers are preserved. If the online inventory tab
+    cannot be cleared, local inventory is kept safe.
+    """
+    if gsheet_is_configured():
+        cloud_result = clear_google_sheet(action="clear_inventory", max_attempts=3)
+        if not cloud_result.get("ok"):
+            return {
+                "ok": False,
+                "cloud_ok": False,
+                "error": "Google Inventory Log was not cleared, so local inventory was kept safe. "
+                         + (cloud_result.get("error") or "Unknown Google Sheets error."),
+            }
+    else:
+        cloud_result = {"ok": True, "cleared": 0, "skipped": True}
+
     try:
         clear_inventory_local()
-        return {"ok": True, "error": None}
     except Exception as exc:
-        return {"ok": False, "error": f"Could not clear inventory: {exc}"}
+        return {
+            "ok": False,
+            "cloud_ok": True,
+            "error": f"Google Inventory Log was cleared, but local inventory could not be cleared: {exc}",
+        }
+
+    return {
+        "ok": True,
+        "cloud_ok": True,
+        "cloud_cleared": int(cloud_result.get("cleared", 0) or 0),
+        "error": None,
+    }
 
 
 def clear_everything():
@@ -608,6 +744,7 @@ def reset_runtime_state_after_clear():
     st.session_state.confirm_delete_product = None
     st.session_state.gsheet_last_manual_sync = None
     st.session_state.pop("gsheet_sync_status", None)
+    st.session_state.pop("inventory_sync_status", None)
     st.session_state.pop("checkout_feedback", None)
     st.session_state.pop("add_product_feedback", None)
     st.session_state["clear_everything_confirm"] = ""
@@ -847,6 +984,9 @@ def _save_new_product():
     st.session_state["add_p_markup"] = 0.0
     st.session_state["add_p_stock"] = 0
 
+    if gsheet_is_configured():
+        st.session_state["inventory_sync_status"] = sync_inventory_to_gsheet()
+
 
 def _complete_transaction():
     """on_click callback for the Complete Transaction button.
@@ -939,6 +1079,12 @@ def _complete_transaction():
     if new_sale_rows_df is not None:
         sync_result = sync_dataframe_to_gsheet(new_sale_rows_df)
         st.session_state["gsheet_sync_status"] = sync_result
+
+    # Keep the dedicated Google Inventory Log synchronized with stock changes
+    # caused by this sale. A failure here does not undo the completed sale;
+    # Admin can use the manual inventory sync to retry.
+    if gsheet_is_configured():
+        st.session_state["inventory_sync_status"] = sync_inventory_to_gsheet()
 
     docx_bytes = generate_receipt_docx(
         receipt_id, st.session_state.active_cashier, pay_method, st.session_state.cart,
@@ -1244,6 +1390,38 @@ elif role == "📦 Stock Inventory":
     df_products = pd.read_sql_query("SELECT * FROM products", conn)
     conn.close()
 
+    if gsheet_is_configured():
+        inv_g1, inv_g2, inv_g3 = st.columns([1, 1, 1])
+        with inv_g1:
+            st.caption("☁️ Google Inventory Log")
+        with inv_g2:
+            if st.button(
+                "🔄 Sync Inventory",
+                use_container_width=True,
+                key="sync_inventory_manual",
+                help="Mirror the complete current POS inventory into the Google Inventory Log tab.",
+            ):
+                with st.spinner("Syncing inventory to Google Sheets..."):
+                    inventory_result = sync_inventory_to_gsheet()
+                st.session_state["inventory_sync_status"] = inventory_result
+                if inventory_result.get("ok"):
+                    st.success(f"Inventory synced: {inventory_result.get('updated', 0)} product row(s).")
+                else:
+                    st.error(f"Inventory sync failed: {inventory_result.get('error') or 'Unknown error'}")
+        with inv_g3:
+            sheet_link = gsheet_url()
+            if sheet_link:
+                st.link_button("🔗 Open Google Inventory", sheet_link, use_container_width=True)
+
+        inv_sync_status = st.session_state.pop("inventory_sync_status", None)
+        if inv_sync_status:
+            if inv_sync_status.get("ok"):
+                st.caption(
+                    f"☁️ Google Inventory Log is up to date ({inv_sync_status.get('updated', 0)} product row(s))."
+                )
+            elif inv_sync_status.get("error"):
+                st.warning(f"Google Inventory Log: {inv_sync_status.get('error')}")
+
     inv_main_list, inv_main_add = st.tabs(["📋 Product List & Manage", "➕ Add Product"])
 
     # =========================================================
@@ -1360,6 +1538,10 @@ elif role == "📦 Stock Inventory":
                         )
                         conn.commit()
                         conn.close()
+                        if gsheet_is_configured():
+                            sync_status = sync_inventory_to_gsheet()
+                            if not sync_status.get("ok"):
+                                st.warning(f"Product updated locally, but Google Inventory Log sync failed: {sync_status.get('error')}")
                         st.success(f"Updated product details for '{edit_name}'.")
                         st.rerun()
 
@@ -1385,6 +1567,10 @@ elif role == "📦 Stock Inventory":
                             conn.commit()
                             conn.close()
                             st.session_state.confirm_delete_product = None
+                            if gsheet_is_configured():
+                                sync_status = sync_inventory_to_gsheet()
+                                if not sync_status.get("ok"):
+                                    st.warning(f"Product removed locally, but Google Inventory Log sync failed: {sync_status.get('error')}")
                             st.success(f"Removed '{delete_label}' from inventory.")
                             st.rerun()
                     with conf_col2:
@@ -1577,6 +1763,39 @@ elif role == "📊 Admin Dashboard":
                         )
 
         # -----------------------------------------------------
+        # GOOGLE INVENTORY
+        # -----------------------------------------------------
+        st.markdown("---")
+        st.markdown("###### 📦 Google Inventory Log")
+        if not gsheet_is_configured():
+            st.info("Configure Google Sheets above to enable the online Inventory Log.")
+        else:
+            inv_g_col1, inv_g_col2 = st.columns([1, 1])
+            with inv_g_col1:
+                sheet_link = gsheet_url()
+                if sheet_link:
+                    st.link_button("🔗 Open Google Inventory", sheet_link, use_container_width=True)
+            with inv_g_col2:
+                if st.button(
+                    "🔄 Sync Inventory Now",
+                    use_container_width=True,
+                    key="admin_sync_inventory",
+                    help="Replace the Google Inventory Log data with the complete current local inventory.",
+                ):
+                    with st.spinner("Syncing complete inventory to Google Sheets..."):
+                        inventory_result = sync_inventory_to_gsheet()
+                    st.session_state["inventory_sync_status"] = inventory_result
+                    if inventory_result.get("ok"):
+                        st.success(
+                            f"Google Inventory Log updated with {inventory_result.get('updated', 0)} product row(s)."
+                        )
+                    else:
+                        st.error(
+                            f"Google Inventory sync failed after {inventory_result.get('attempts', 0)} attempt(s): "
+                            f"{inventory_result.get('error') or 'Unknown error'}"
+                        )
+
+        # -----------------------------------------------------
         # DANGER ZONE: DATA CLEAR CONTROLS
         # -----------------------------------------------------
         st.markdown("---")
@@ -1584,8 +1803,8 @@ elif role == "📊 Admin Dashboard":
         st.warning(
             "These controls permanently delete data. **Clear Sales Only** removes sales history "
             "from both the POS and the Google Sales Log while keeping products and cashiers. "
-            "**Clear Inventory Only** removes products and stock while keeping sales and cashiers. "
-            "**Clear Everything** removes all POS data and all Google Sales Log rows. These actions cannot be undone."
+            "**Clear Inventory Only** removes products/stock from both the POS and the Google Inventory Log while keeping sales and cashiers. "
+            "**Clear Everything** removes all POS data plus all Google Sales Log and Google Inventory Log rows. These actions cannot be undone."
         )
 
         danger_col1, danger_col2, danger_col3 = st.columns(3)
@@ -1644,7 +1863,7 @@ elif role == "📊 Admin Dashboard":
 
         with danger_col2:
             st.markdown("#### 📦 Clear Inventory Only")
-            st.caption("Deletes all products and stock. Sales history and cashiers remain.")
+            st.caption("Deletes all products and stock from both the POS and Google Inventory Log. Sales history and cashiers remain.")
             if not st.session_state.show_clear_inventory_confirm:
                 if st.button(
                     "📦 Clear Inventory Only",
@@ -1682,21 +1901,24 @@ elif role == "📊 Admin Dashboard":
                     st.rerun()
 
                 if confirm_inventory:
-                    with st.spinner("Clearing inventory..."):
+                    with st.spinner("Clearing inventory from POS and Google Sheets..."):
                         result = clear_inventory()
                     if result.get("ok"):
                         st.session_state.cart = []
                         st.session_state.selected_category = "All"
                         st.session_state.clear_inventory_confirm = ""
                         st.session_state.show_clear_inventory_confirm = False
-                        st.success("✅ Inventory cleared. All products and stock were removed. Sales and cashiers were kept.")
+                        st.success(
+                            f"✅ Inventory cleared. Local products/stock removed and Google Inventory Log rows removed: "
+                            f"{result.get('cloud_cleared', 0)}. Sales and cashiers were kept."
+                        )
                         st.rerun()
                     else:
                         st.error(result.get("error") or "Could not clear inventory.")
 
         with danger_col3:
             st.markdown("#### 🗑️ Clear Everything")
-            st.caption("Deletes products, stock, sales, cashiers, and Google Sales Log rows.")
+            st.caption("Deletes products, stock, sales, cashiers, Google Sales Log rows, and Google Inventory Log rows.")
             if not st.session_state.show_clear_everything_confirm:
                 if st.button(
                     "🗑️ Clear Everything",
@@ -1741,7 +1963,7 @@ elif role == "📊 Admin Dashboard":
                         reset_runtime_state_after_clear()
                         st.success(
                             "✅ Everything has been cleared successfully. Products, stock, sales history, "
-                            "cashiers, and Google Sheets sale rows have been removed."
+                            "cashiers, Google Sales Log rows, and Google Inventory Log rows have been removed."
                         )
                         st.rerun()
                     else:
