@@ -34,7 +34,7 @@ except ImportError:
 # ============================================================
 GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxtk6yTSHJG6PGy2ZzGA7oczM9bDm78-o-FDuy_tZZfi-Puoltms8KHqgRSt0-26dI/exec"
 GSHEET_WEBAPP_SECRET = "POS-SI-2026-9xK7mQ4vT8pL2"
-GSHEET_SHARE_URL = "https://docs.google.com/spreadsheets/d/1eokIRdiCSkEIkSSCkMT6kMERMJDUA1i7iUIk60Wzqa8/edit?usp=sharing"
+GSHEET_SHARE_URL = "https://docs.google.com/spreadsheets/d/1eokIRdiCSkEIkSSckMT6kMERMJDuA1i7iUIk6OWzqa8/edit?gid=1843822426#gid=1843822426"
 
 st.set_page_config(page_title="POS & Inventory System", layout="wide", page_icon="🧾")
 
