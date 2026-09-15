@@ -32,7 +32,7 @@ except ImportError:
 # Cloud, or .streamlit/secrets.toml locally) — either way works, this file
 # checks secrets first and only falls back to the lines below.
 # ============================================================
-GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbw2GPnfGIWdRqswdE-2lQK3xx5moNXZSme-SVvoR1xT1C7lK-QfC_bg6b6wCIAYwZ8/exec"
+GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbweM8nNjfaK91rFhdw8Zn2G6271GweQjnBQZbZew_dVxQY_nZUc0simO5zTb-RoL5E/exec"
 GSHEET_WEBAPP_SECRET = "aSEmmzRRuMyFwgRGVn0AQDi7"
 GSHEET_SHARE_URL = ""
 
@@ -273,55 +273,114 @@ def _rows_from_dataframe(df):
     return rows
 
 
-def sync_dataframe_to_gsheet(df):
-    """POST rows to the Apps Script Web App, which de-duplicates by Sale ID
-    on its side and appends whatever's new.
+def sync_dataframe_to_gsheet(df, max_attempts=3):
+    """Push sales rows to the Google Apps Script Web App with automatic retries.
 
-    Returns a dict: {"configured": bool, "ok": bool, "added": int, "error": str|None}
-    The "error" message is meant to be shown to you (the admin) to make
-    debugging the Apps Script deployment fast, since "couldn't reach it" by
-    itself doesn't say why.
+    The Apps Script de-duplicates rows by Sale ID, so retrying a request is safe:
+    already-received sales will not be inserted a second time.
+
+    Returns:
+        {"configured": bool, "ok": bool, "added": int, "attempts": int, "error": str|None}
     """
     if not gsheet_is_configured():
-        return {"configured": False, "ok": False, "added": 0, "error": None}
-    if df.empty:
-        return {"configured": True, "ok": True, "added": 0, "error": None}
+        return {"configured": False, "ok": False, "added": 0, "attempts": 0, "error": None}
+
+    if df is None or df.empty:
+        return {"configured": True, "ok": True, "added": 0, "attempts": 0, "error": None}
+
+    if not GSHEETS_LIB_AVAILABLE:
+        return {
+            "configured": False,
+            "ok": False,
+            "added": 0,
+            "attempts": 0,
+            "error": "The requests package is not installed.",
+        }
+
+    secret = _gsheet_config("gsheet_webapp_secret", GSHEET_WEBAPP_SECRET) or ""
+    url = _gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, must_be_url=True)
+
+    if not secret:
+        return {
+            "configured": True,
+            "ok": False,
+            "added": 0,
+            "attempts": 0,
+            "error": "Google Sheets shared secret is missing. Set gsheet_webapp_secret in Streamlit secrets or GSHEET_WEBAPP_SECRET in app.py.",
+        }
 
     payload = {
-        "secret": _gsheet_config("gsheet_webapp_secret", GSHEET_WEBAPP_SECRET) or "",
+        "secret": secret,
         "headers": GSHEET_HEADERS,
         "rows": _rows_from_dataframe(df),
     }
-    url = _gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, must_be_url=True)
 
+    attempts = max(1, int(max_attempts))
+    last_error = "Unknown Google Sheets sync error."
+
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=20)
+        except requests.exceptions.RequestException as exc:
+            last_error = f"Network error reaching the Web App: {exc}"
+        else:
+            if resp.status_code != 200:
+                snippet = resp.text[:300].replace("\n", " ")
+                last_error = (
+                    f"Web App returned HTTP {resp.status_code}. "
+                    f"Response started with: {snippet!r}"
+                )
+            else:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    snippet = resp.text[:300].replace("\n", " ")
+                    last_error = (
+                        "Web App didn't return JSON — check that the Apps Script is deployed as a Web App "
+                        "with 'Who has access' set to 'Anyone', and that the /exec URL is current. "
+                        f"Response started with: {snippet!r}"
+                    )
+                else:
+                    if data.get("status") == "ok":
+                        return {
+                            "configured": True,
+                            "ok": True,
+                            "added": int(data.get("added", 0)),
+                            "attempts": attempt,
+                            "error": None,
+                        }
+                    last_error = data.get("message", "Unknown error from the Web App.")
+
+        if attempt < attempts:
+            # Short exponential backoff: 1s, then 2s. This helps with
+            # temporary network/Google service hiccups without making a
+            # checkout feel stuck for too long.
+            import time
+            time.sleep(2 ** (attempt - 1))
+
+    return {
+        "configured": True,
+        "ok": False,
+        "added": 0,
+        "attempts": attempts,
+        "error": last_error,
+    }
+
+
+def sync_all_sales_to_gsheet():
+    """Sync the complete local sales history to Google Sheets.
+
+    This is intentionally separate from the filtered reporting view so the
+    Admin Dashboard's manual retry can recover any older or previously failed
+    sales, not just today's currently displayed rows. The Apps Script prevents
+    duplicate Sale IDs.
+    """
+    conn = get_connection()
     try:
-        resp = requests.post(url, json=payload, timeout=15)
-    except requests.exceptions.RequestException as exc:
-        return {"configured": True, "ok": False, "added": 0, "error": f"Network error reaching the Web App: {exc}"}
-
-    if resp.status_code != 200:
-        snippet = resp.text[:200].replace("\n", " ")
-        return {
-            "configured": True, "ok": False, "added": 0,
-            "error": f"Web App returned HTTP {resp.status_code}. Response started with: {snippet!r}",
-        }
-
-    try:
-        data = resp.json()
-    except ValueError:
-        snippet = resp.text[:200].replace("\n", " ")
-        return {
-            "configured": True, "ok": False, "added": 0,
-            "error": (
-                "Web App didn't return JSON — this usually means the deployment's 'Who has access' isn't set to "
-                f"'Anyone', or gsheet_webapp_url is stale/wrong. Response started with: {snippet!r}"
-            ),
-        }
-
-    if data.get("status") != "ok":
-        return {"configured": True, "ok": False, "added": 0, "error": data.get("message", "Unknown error from the Web App.")}
-
-    return {"configured": True, "ok": True, "added": int(data.get("added", 0)), "error": None}
+        df = pd.read_sql_query("SELECT * FROM sales ORDER BY id ASC", conn)
+    finally:
+        conn.close()
+    return sync_dataframe_to_gsheet(df, max_attempts=3)
 
 
 def get_connection():
@@ -671,6 +730,8 @@ if "last_receipt" not in st.session_state:
     st.session_state.last_receipt = None
 if "confirm_delete_product" not in st.session_state:
     st.session_state.confirm_delete_product = None
+if "gsheet_last_manual_sync" not in st.session_state:
+    st.session_state.gsheet_last_manual_sync = None
 
 # ---------------------------------------------------------
 # SIDEBAR
@@ -715,11 +776,14 @@ if role == "🛒 Cashier Terminal":
         sync_status = st.session_state.pop("gsheet_sync_status", None)
         if sync_status and sync_status.get("configured") and not sync_status.get("ok"):
             st.caption(
-                f"⚠️ Couldn't sync this sale to Google Sheets ({sync_status.get('error')}). "
-                "It's still saved locally — use **Sync Now** on the Admin Dashboard to retry."
+                f"⚠️ Couldn't sync this sale to Google Sheets after {sync_status.get('attempts', 1)} attempt(s): "
+                f"{sync_status.get('error')}. It's still saved locally — use **Sync Now** on the Admin Dashboard to retry."
             )
         elif sync_status and sync_status.get("ok") and sync_status.get("added", 0) > 0:
-            st.caption("☁️ Synced to the shared Google Sheet.")
+            st.caption(
+                f"☁️ Synced to the shared Google Sheet ({sync_status.get('added', 0)} row(s), "
+                f"{sync_status.get('attempts', 1)} attempt(s))."
+            )
         rc_col1, rc_col2 = st.columns([2, 1])
         with rc_col1:
             st.download_button(
@@ -1225,6 +1289,7 @@ elif role == "📊 Admin Dashboard":
                     "Ask me for setup steps if you'd like."
                 )
             else:
+                st.success("☁️ Google Sheets connection is configured. New completed sales are sent automatically, with automatic retry if a temporary connection problem occurs.")
                 gs_col1, gs_col2 = st.columns([1, 1])
                 with gs_col1:
                     sheet_link = gsheet_url()
@@ -1233,15 +1298,36 @@ elif role == "📊 Admin Dashboard":
                     else:
                         st.caption("Add `gsheet_share_url` to secrets to show an Open link here.")
                 with gs_col2:
-                    if st.button("🔄 Sync Now", use_container_width=True, help="Push any rows from this filtered view that aren't in the sheet yet."):
-                        with st.spinner("Syncing to Google Sheets..."):
-                            result = sync_dataframe_to_gsheet(filtered_df)
+                    if st.button(
+                        "🔄 Sync Now",
+                        use_container_width=True,
+                        help="Sync the complete local sales history. Existing Sale IDs are ignored by the Google Apps Script, so this is safe to run again.",
+                    ):
+                        with st.spinner("Syncing all local sales to Google Sheets..."):
+                            result = sync_all_sales_to_gsheet()
+                        st.session_state.gsheet_last_manual_sync = result
                         if not result["ok"]:
-                            st.error(f"Couldn't reach the Google Sheet: {result['error']}")
+                            st.error(
+                                f"Google Sheets sync failed after {result.get('attempts', 0)} attempt(s): "
+                                f"{result.get('error') or 'Unknown error'}"
+                            )
                         elif result["added"] == 0:
-                            st.success("Already up to date — nothing new to sync.")
+                            st.success(
+                                f"Google Sheet is already up to date. Checked all local sales "
+                                f"({result.get('attempts', 1)} attempt)."
+                            )
                         else:
-                            st.success(f"Synced {result['added']} row(s) to the Google Sheet.")
+                            st.success(
+                                f"Synced {result['added']} new sale row(s) to Google Sheets "
+                                f"in {result.get('attempts', 1)} attempt(s)."
+                            )
+
+                    last_manual_sync = st.session_state.get("gsheet_last_manual_sync")
+                    if last_manual_sync and last_manual_sync.get("ok"):
+                        st.caption(
+                            f"Last manual sync: {last_manual_sync.get('added', 0)} new row(s) added; "
+                            f"{last_manual_sync.get('attempts', 1)} attempt(s)."
+                        )
 
     with admin_tab2:
         st.markdown("##### Add Cashier Profile")
