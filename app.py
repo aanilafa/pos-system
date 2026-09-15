@@ -32,9 +32,9 @@ except ImportError:
 # Cloud, or .streamlit/secrets.toml locally) — either way works, this file
 # checks secrets first and only falls back to the lines below.
 # ============================================================
-GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbweM8nNjfaK91rFhdw8Zn2G6271GweQjnBQZbZew_dVxQY_nZUc0simO5zTb-RoL5E/exec"
+GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbzxjul5CfslAS-e8R1CqHYwvqa-7Ejlhud5e3JAULj71IixB7uJ2ZSEG_aCIIkQutk/exec"
 GSHEET_WEBAPP_SECRET = "POS-SI-2026-9xK7mQ4vT8pL2"
-GSHEET_SHARE_URL = "https://script.google.com/macros/s/AKfycbweM8nNjfaK91rFhdw8Zn2G6271GweQjnBQZbZew_dVxQY_nZUc0simO5zTb-RoL5E/exec"
+GSHEET_SHARE_URL = "https://script.google.com/macros/s/AKfycbzxjul5CfslAS-e8R1CqHYwvqa-7Ejlhud5e3JAULj71IixB7uJ2ZSEG_aCIIkQutk/exec"
 
 st.set_page_config(page_title="POS & Inventory System", layout="wide", page_icon="🧾")
 
