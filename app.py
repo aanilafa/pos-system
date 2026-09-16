@@ -32,9 +32,9 @@ except ImportError:
 # Cloud, or .streamlit/secrets.toml locally) — either way works, this file
 # checks secrets first and only falls back to the lines below.
 # ============================================================
-GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxtk6yTSHJG6PGy2ZzGA7oczM9bDm78-o-FDuy_tZZfi-Puoltms8KHqgRSt0-26dI/exec"
+GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxtk6yTSHJG6Py2ZzGA7oczM9bDm78-oFDuy_TZFi-Puolm8sKHggRSt0-26dI/exec"
 GSHEET_WEBAPP_SECRET = "POS-SI-2026-9xK7mQ4vT8pL2"
-GSHEET_SHARE_URL = "https://docs.google.com/spreadsheets/d/1eokIRdiCSkEIkSSckMT6kMERMJDuA1i7iUIk6OWzqa8/edit?gid=1843822426#gid=1843822426"
+GSHEET_SHARE_URL = "https://docs.google.com/spreadsheets/d/1eokIRdiCSkEIkSSCkMT6kMERMJDUA1i7iUIk60Wzqa8/edit?usp=sharing"
 
 st.set_page_config(page_title="POS & Inventory System", layout="wide", page_icon="🧾")
 
@@ -207,6 +207,17 @@ GSHEET_INVENTORY_HEADERS = [
     "Product ID", "Product", "Price Tier / Variant", "Category",
     "Unit Cost", "Selling Price", "Margin", "Stock", "Status",
 ]
+
+
+# Daily-recording mode:
+# - Inventory and cashier records persist from day to day.
+# - Sales are automatically reset at the start of a new calendar day.
+# - On the first run after this version is installed, the existing inventory,
+#   cashiers, and sales are cleared once so the system starts from a clean slate.
+DAILY_RECORDING_VERSION = "daily_recording_v1"
+FRESH_START_KEY = "fresh_start_completed"
+LAST_SALES_DAY_KEY = "last_sales_day"
+
 
 
 def _looks_like_url(value):
@@ -755,6 +766,105 @@ def reset_runtime_state_after_clear():
     st.session_state["show_clear_inventory_confirm"] = False
 
 
+def _get_app_setting(key):
+    """Read a small persistent app setting from SQLite."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def _set_app_setting(key, value):
+    """Write a small persistent app setting to SQLite."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def initialize_daily_recording_mode():
+    """Apply the requested clean-start and daily sales reset rules.
+
+    First run after this version is installed:
+      * Clear local sales, products, and cashiers.
+      * Clear Google Sales Log and Google Inventory Log.
+      * Mark the clean start as completed so normal app restarts do not erase inventory.
+
+    Every later calendar day:
+      * Clear only sales locally and in Google Sales Log.
+      * Keep inventory and cashiers untouched.
+
+    If Google Sheets is configured but cannot be cleared, local data is kept safe
+    and the reset is retried on the next app run.
+    """
+    fresh_done = _get_app_setting(FRESH_START_KEY)
+    today_text = date.today().isoformat()
+
+    if fresh_done != DAILY_RECORDING_VERSION:
+        # The user's requested initial state is completely blank inventory and
+        # cashier lists. Clear the online copies first so we never knowingly
+        # leave the two stores out of sync.
+        if gsheet_is_configured():
+            cloud_result = clear_google_sheet(action="clear_all", max_attempts=3)
+            if not cloud_result.get("ok"):
+                st.warning(
+                    "Daily recording setup could not clear the Google Sales/Inventory sheets yet. "
+                    "Your existing local data was kept safe. The reset will be retried automatically."
+                )
+                return False
+
+        try:
+            clear_local_data()
+        except Exception as exc:
+            st.warning(f"The initial clean setup could not finish: {exc}")
+            return False
+
+        _set_app_setting(FRESH_START_KEY, DAILY_RECORDING_VERSION)
+        _set_app_setting(LAST_SALES_DAY_KEY, today_text)
+        st.session_state["daily_reset_message"] = (
+            "System started with a clean Inventory, Cashier list, and Sales record. "
+            "From tomorrow onward, only Sales will reset automatically; Inventory and Cashiers will remain."
+        )
+        return True
+
+    last_sales_day = _get_app_setting(LAST_SALES_DAY_KEY)
+    if last_sales_day != today_text:
+        # New day: only the sales record is renewed. Inventory and cashiers stay.
+        if gsheet_is_configured():
+            cloud_result = clear_google_sheet(action="clear_sales", max_attempts=3)
+            if not cloud_result.get("ok"):
+                st.warning(
+                    "A new day was detected, but Google Sales Log could not be cleared yet. "
+                    "Local sales were kept safe and the reset will be retried automatically."
+                )
+                return False
+
+        try:
+            clear_sales_local()
+        except Exception as exc:
+            st.warning(f"The new-day sales reset could not finish: {exc}")
+            return False
+
+        _set_app_setting(LAST_SALES_DAY_KEY, today_text)
+        st.session_state["daily_reset_message"] = (
+            f"New day started ({today_text}). Sales were reset for today's recording. "
+            "Inventory and Cashiers were kept."
+        )
+        # Remove any stale transaction/session data from the previous day.
+        reset_runtime_state_after_clear()
+        return True
+
+    return True
+
+
 def get_connection():
     conn = sqlite3.connect("inventory.db")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -764,6 +874,12 @@ def get_connection():
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -849,6 +965,7 @@ def init_db():
 
 
 init_db()
+initialize_daily_recording_mode()
 
 
 # ---------------------------------------------------------
@@ -1125,12 +1242,18 @@ if "show_clear_inventory_confirm" not in st.session_state:
     st.session_state.show_clear_inventory_confirm = False
 if "clear_inventory_confirm" not in st.session_state:
     st.session_state.clear_inventory_confirm = ""
+if "daily_reset_message" not in st.session_state:
+    st.session_state.daily_reset_message = None
+
+if st.session_state.daily_reset_message:
+    st.info(f"📅 {st.session_state.daily_reset_message}")
+    st.session_state.daily_reset_message = None
 
 # ---------------------------------------------------------
 # SIDEBAR
 # ---------------------------------------------------------
 st.sidebar.markdown("### 🧾 POS System")
-st.sidebar.caption("Manage sales, stock, and reports")
+st.sidebar.caption("Daily sales recording • Inventory & cashiers persist")
 role = st.sidebar.radio(
     "Navigation",
     ["🛒 Cashier Terminal", "📦 Stock Inventory", "📊 Admin Dashboard"],
@@ -1619,11 +1742,12 @@ elif role == "📦 Stock Inventory":
 # VIEW 3: ADMIN DASHBOARD & REPORTS
 # ---------------------------------------------------------
 elif role == "📊 Admin Dashboard":
-    st.title("📊 Admin Dashboard & Analytics")
+    st.title("📊 Admin Dashboard & Daily Records")
 
     admin_tab1, admin_tab2 = st.tabs(["📈 Sales Reporting", "👤 Cashier Management"])
 
     with admin_tab1:
+        st.caption("Sales automatically start fresh each calendar day. Inventory and cashier records are kept until you manually clear them.")
         conn = get_connection()
         df_sales = pd.read_sql_query("SELECT * FROM sales ORDER BY timestamp DESC", conn)
         df_cashiers = pd.read_sql_query("SELECT name FROM cashiers", conn)
