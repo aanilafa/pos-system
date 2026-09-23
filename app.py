@@ -4,15 +4,13 @@ import pandas as pd
 from datetime import datetime, date
 import io
 import random
+import time
 from docx import Document
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# Google Sheets sync is optional — the app must keep working even if this
-# package isn't installed or nothing has been configured yet.
 try:
     import requests
     GSHEETS_LIB_AVAILABLE = True
@@ -20,2106 +18,685 @@ except ImportError:
     GSHEETS_LIB_AVAILABLE = False
 
 # ============================================================
-# PASTE YOUR GOOGLE SHEET CONFIG HERE (between the quotes)
-# ------------------------------------------------------------
-# GSHEET_WEBAPP_URL   = the Apps Script Web App URL, must end in /exec
-# GSHEET_WEBAPP_SECRET = the same SHARED_SECRET you set inside the script
-# GSHEET_SHARE_URL   = the normal Google Sheet link (for the "Open" button)
-#
-# Note: since this file often ends up in a public/shared repo, anyone who
-# can see this code can also see these values. If that's a concern, use
-# Streamlit's secrets manager instead (Settings → Secrets on Streamlit
-# Cloud, or .streamlit/secrets.toml locally) — either way works, this file
-# checks secrets first and only falls back to the lines below.
+# PHONE REPAIR SHOP - CONFIGURATION
 # ============================================================
+DB_FILE = "inventory.db"  # keeps the existing app database location
+ADMIN_PIN = "1234"         # CHANGE THIS before deploying
+
 GSHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxtk6yTSHJG6PGy2ZzGA7oczM9bDm78-o-FDuy_tZZfi-Puoltms8KHqgRSt0-26dI/exec"
 GSHEET_WEBAPP_SECRET = "POS-SI-2026-9xK7mQ4vT8pL2"
 GSHEET_SHARE_URL = "https://docs.google.com/spreadsheets/d/1eokIRdiCSkEIkSSckMT6kMERMJDuA1i7iUIk6OWzqa8/edit?gid=1843822426#gid=1843822426"
 
-st.set_page_config(page_title="POS & Inventory System", layout="wide", page_icon="🧾")
+st.set_page_config(page_title="Phone Repair Shop System", layout="wide", page_icon="📱")
 
-# ---------------------------------------------------------
-# STYLING
-# ---------------------------------------------------------
 st.markdown("""
-    <style>
-    .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
-    }
-    div[data-testid="stHorizontalBlock"] button {
-        border-radius: 6px !important;
-        font-weight: 600 !important;
-        height: 42px !important;
-    }
-    .product-btn > button {
-        height: 85px !important;
-        white-space: pre-wrap !important;
-        border-radius: 8px !important;
-        border: 1px solid #e0e0e0 !important;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04) !important;
-        transition: all 0.2s ease;
-    }
-    .product-btn > button:hover {
-        border-color: #0066cc !important;
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.08) !important;
-    }
-    .product-btn > button p {
-        font-size: 15px !important;
-        font-weight: 600 !important;
-        margin: 0 !important;
-    }
-    .cart-summary-box {
-        background-color: #f8f9fa;
-        border: 1px solid #e9ecef;
-        border-radius: 8px;
-        padding: 16px;
-        margin-top: 12px;
-        margin-bottom: 16px;
-    }
-    .cart-line {
-        border-bottom: 1px solid #eee;
-        padding: 8px 0;
-    }
-    .stock-pill {
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 10px;
-        font-size: 12px;
-        font-weight: 600;
-    }
-    </style>
+<style>
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
+div[data-testid="stHorizontalBlock"] button { border-radius: 7px !important; font-weight: 600 !important; min-height: 40px !important; }
+.job-card { border:1px solid #e5e7eb; border-radius:10px; padding:14px; margin-bottom:10px; background:#fafafa; }
+.status-pill { display:inline-block; padding:4px 9px; border-radius:12px; font-size:12px; font-weight:700; }
+.small-note { color:#6b7280; font-size:0.9rem; }
+</style>
 """, unsafe_allow_html=True)
 
-CATEGORIES = ["Patch", "Tube", "Tires", "Car Wash", "Others"]
 PAYMENT_METHODS = ["Cash", "Card", "Bank Transfer"]
+REPAIR_STATUSES = ["Received", "Diagnosing", "Waiting for Parts", "Repairing", "Ready for Collection", "Collected", "Cancelled"]
+DEVICE_TYPES = ["Smartphone", "Tablet", "Smartwatch", "Other"]
+PRODUCT_CATEGORIES = ["Screens", "Batteries", "Charging Parts", "Cameras", "Speakers", "Microphones", "Connectors", "IC / Boards", "Tools", "Accessories", "Other"]
 
-
-def format_product_label(row):
-    """Build a display label that stays unique even when multiple rows
-    share the same product name (e.g. the same item stocked at different
-    markups/price tiers)."""
-    variant = (row.get('variant_label') or '').strip() if hasattr(row, 'get') else (row['variant_label'] or '').strip()
-    variant_part = f" · {variant}" if variant else ""
-    return f"{row['name']}{variant_part} — ${row['price']:.2f} (#{int(row['id'])})"
-
-
-# Money columns get a currency number format and right alignment in exports.
-CURRENCY_COLUMNS = {"Unit Cost", "Unit Price", "Discount", "Total", "Profit", "Margin", "Selling Price"}
-
-
-def build_formatted_sales_excel(df, sheet_name):
-    """Return bytes for a nicely formatted .xlsx export of a sales dataframe,
-    including per-line unit cost/unit price and a computed profit column."""
-    export_df = df.copy()
-
-    # Compute profit per line (revenue actually collected minus what the
-    # stock cost us) before renaming columns for display.
-    if "unit_cost" in export_df.columns and "quantity" in export_df.columns and "total_price" in export_df.columns:
-        export_df["profit"] = export_df["total_price"] - (export_df["unit_cost"] * export_df["quantity"])
-
-    rename_map = {
-        "id": "Sale ID",
-        "receipt_id": "Receipt Ref",
-        "product_name": "Product",
-        "quantity": "Qty",
-        "unit_cost": "Unit Cost",
-        "unit_price": "Unit Price",
-        "discount_amount": "Discount",
-        "total_price": "Total",
-        "profit": "Profit",
-        "payment_method": "Payment Method",
-        "cashier": "Cashier",
-        "timestamp": "Timestamp",
-    }
-    export_df = export_df.rename(columns=rename_map)
-    ordered_cols = [c for c in [
-        "Sale ID", "Receipt Ref", "Timestamp", "Product", "Qty",
-        "Unit Cost", "Unit Price", "Discount", "Total", "Profit",
-        "Payment Method", "Cashier",
-    ] if c in export_df.columns]
-    export_df = export_df[ordered_cols]
-
-    excel_buffer = io.BytesIO()
-    sheet_name = sheet_name[:31]  # Excel sheet name limit
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        export_df.to_excel(writer, index=False, sheet_name=sheet_name)
-        worksheet = writer.sheets[sheet_name]
-
-        header_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
-        header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-        body_font = Font(name="Arial", size=10)
-        thin_border = Border(
-            left=Side(style="thin", color="D9D9D9"),
-            right=Side(style="thin", color="D9D9D9"),
-            top=Side(style="thin", color="D9D9D9"),
-            bottom=Side(style="thin", color="D9D9D9"),
-        )
-
-        n_rows = worksheet.max_row
-        n_cols = worksheet.max_column
-
-        for col_idx in range(1, n_cols + 1):
-            header_cell = worksheet.cell(row=1, column=col_idx)
-            header_cell.font = header_font
-            header_cell.fill = header_fill
-            header_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            header_cell.border = thin_border
-
-            col_name = export_df.columns[col_idx - 1]
-            is_currency = col_name in CURRENCY_COLUMNS
-
-            for row_idx in range(2, n_rows + 1):
-                cell = worksheet.cell(row=row_idx, column=col_idx)
-                cell.font = body_font
-                cell.border = thin_border
-                if is_currency:
-                    cell.number_format = '"$"#,##0.00'
-                    cell.alignment = Alignment(horizontal="right")
-                else:
-                    cell.alignment = Alignment(horizontal="left")
-
-            col_letter = get_column_letter(col_idx)
-            max_len = max(
-                [len(str(col_name))] + [len(str(worksheet.cell(row=r, column=col_idx).value or "")) for r in range(2, n_rows + 1)]
-            )
-            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 12)
-
-        worksheet.freeze_panes = "A2"
-        worksheet.auto_filter.ref = worksheet.dimensions
-        worksheet.row_dimensions[1].height = 28
-
-    return excel_buffer.getvalue()
-
-
-# ---------------------------------------------------------
-# GOOGLE SHEETS SYNC (free version — via a Google Apps Script Web App
-# deployed from inside the target sheet itself; no Google Cloud project,
-# service account, or billing needed).
-# ---------------------------------------------------------
 GSHEET_HEADERS = [
     "Sale ID", "Timestamp", "Receipt Ref", "Product", "Qty",
     "Unit Cost", "Unit Price", "Discount", "Total", "Profit",
     "Payment Method", "Cashier",
 ]
-
 GSHEET_INVENTORY_HEADERS = [
     "Product ID", "Product", "Price Tier / Variant", "Category",
     "Unit Cost", "Selling Price", "Margin", "Stock", "Status",
 ]
 
-
-# Daily-recording mode:
-# - Inventory and cashier records persist from day to day.
-# - Sales are automatically reset at the start of a new calendar day.
-# - On the first run after this version is installed, the existing inventory,
-#   cashiers, and sales are cleared once so the system starts from a clean slate.
-DAILY_RECORDING_VERSION = "daily_recording_v1"
-FRESH_START_KEY = "fresh_start_completed"
-LAST_SALES_DAY_KEY = "last_sales_day"
-
-
-
-def _looks_like_url(value):
-    """Guard against placeholder text (e.g. someone pasted the instruction
-    'the web app URL you just copied' instead of the real link) being treated
-    as a real URL."""
-    return isinstance(value, str) and value.strip().startswith(("https://", "http://"))
-
-
-def _gsheet_config(secret_key, hardcoded_value, must_be_url=False):
-    """Prefer Streamlit secrets if set; otherwise fall back to the hardcoded
-    constants at the top of this file. Returns None if neither is usable.
-
-    When must_be_url is True, a value that isn't an http(s) link is treated as
-    unset, so leftover placeholder text in secrets doesn't silently override a
-    correctly-filled-in hardcoded URL."""
-    candidates = []
-    try:
-        candidates.append(st.secrets.get(secret_key))
-    except Exception:
-        pass  # st.secrets raises if no secrets.toml/secrets configured at all
-    candidates.append(hardcoded_value)
-
-    for val in candidates:
-        if not val or not str(val).strip():
-            continue
-        val = str(val).strip()
-        if must_be_url and not _looks_like_url(val):
-            continue
-        return val
-    return None
-
-
-def gsheet_is_configured():
-    """True only if the library is installed AND a usable Web App URL is set
-    (either via secrets or hardcoded at the top of this file)."""
-    if not GSHEETS_LIB_AVAILABLE:
-        return False
-    return bool(_gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, must_be_url=True))
-
-
-def gsheet_url():
-    """Link to actually open/view the sheet (separate from the Web App URL
-    used to push data to it)."""
-    return _gsheet_config("gsheet_share_url", GSHEET_SHARE_URL, must_be_url=True)
-
-
-def _rows_from_dataframe(df):
-    rows = []
-    for _, r in df.iterrows():
-        cost = float(r.get("unit_cost", 0) or 0)
-        qty = int(r.get("quantity", 0) or 0)
-        total = float(r.get("total_price", 0) or 0)
-        profit = total - (cost * qty)
-        rows.append([
-            str(int(r.get("id", 0))),
-            str(r.get("timestamp", "")),
-            str(r.get("receipt_id", "")),
-            str(r.get("product_name", "")),
-            qty,
-            cost,
-            float(r.get("unit_price", 0) or 0),
-            float(r.get("discount_amount", 0) or 0),
-            total,
-            profit,
-            str(r.get("payment_method", "")),
-            str(r.get("cashier", "")),
-        ])
-    return rows
-
-
-def sync_dataframe_to_gsheet(df, max_attempts=3):
-    """Push sales rows to the Google Apps Script Web App with automatic retries.
-
-    The Apps Script de-duplicates rows by Sale ID, so retrying a request is safe:
-    already-received sales will not be inserted a second time.
-
-    Returns:
-        {"configured": bool, "ok": bool, "added": int, "attempts": int, "error": str|None}
-    """
-    if not gsheet_is_configured():
-        return {"configured": False, "ok": False, "added": 0, "attempts": 0, "error": None}
-
-    if df is None or df.empty:
-        return {"configured": True, "ok": True, "added": 0, "attempts": 0, "error": None}
-
-    if not GSHEETS_LIB_AVAILABLE:
-        return {
-            "configured": False,
-            "ok": False,
-            "added": 0,
-            "attempts": 0,
-            "error": "The requests package is not installed.",
-        }
-
-    secret = _gsheet_config("gsheet_webapp_secret", GSHEET_WEBAPP_SECRET) or ""
-    url = _gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, must_be_url=True)
-
-    if not secret:
-        return {
-            "configured": True,
-            "ok": False,
-            "added": 0,
-            "attempts": 0,
-            "error": "Google Sheets shared secret is missing. Set gsheet_webapp_secret in Streamlit secrets or GSHEET_WEBAPP_SECRET in app.py.",
-        }
-
-    payload = {
-        "secret": secret,
-        "headers": GSHEET_HEADERS,
-        "rows": _rows_from_dataframe(df),
-    }
-
-    attempts = max(1, int(max_attempts))
-    last_error = "Unknown Google Sheets sync error."
-
-    for attempt in range(1, attempts + 1):
-        try:
-            resp = requests.post(url, json=payload, timeout=20)
-        except requests.exceptions.RequestException as exc:
-            last_error = f"Network error reaching the Web App: {exc}"
-        else:
-            if resp.status_code != 200:
-                snippet = resp.text[:300].replace("\n", " ")
-                last_error = (
-                    f"Web App returned HTTP {resp.status_code}. "
-                    f"Response started with: {snippet!r}"
-                )
-            else:
-                try:
-                    data = resp.json()
-                except ValueError:
-                    snippet = resp.text[:300].replace("\n", " ")
-                    last_error = (
-                        "Web App didn't return JSON — check that the Apps Script is deployed as a Web App "
-                        "with 'Who has access' set to 'Anyone', and that the /exec URL is current. "
-                        f"Response started with: {snippet!r}"
-                    )
-                else:
-                    if data.get("status") == "ok":
-                        return {
-                            "configured": True,
-                            "ok": True,
-                            "added": int(data.get("added", 0)),
-                            "attempts": attempt,
-                            "error": None,
-                        }
-                    last_error = data.get("message", "Unknown error from the Web App.")
-
-        if attempt < attempts:
-            # Short exponential backoff: 1s, then 2s. This helps with
-            # temporary network/Google service hiccups without making a
-            # checkout feel stuck for too long.
-            import time
-            time.sleep(2 ** (attempt - 1))
-
-    return {
-        "configured": True,
-        "ok": False,
-        "added": 0,
-        "attempts": attempts,
-        "error": last_error,
-    }
-
-
-def sync_all_sales_to_gsheet():
-    """Sync the complete local sales history to Google Sheets.
-
-    This is intentionally separate from the filtered reporting view so the
-    Admin Dashboard's manual retry can recover any older or previously failed
-    sales, not just today's currently displayed rows. The Apps Script prevents
-    duplicate Sale IDs.
-    """
-    conn = get_connection()
-    try:
-        df = pd.read_sql_query("SELECT * FROM sales ORDER BY id ASC", conn)
-    finally:
-        conn.close()
-    return sync_dataframe_to_gsheet(df, max_attempts=3)
-
-
-def _rows_from_inventory_dataframe(df):
-    """Convert the local products dataframe into the Google Inventory Log shape."""
-    rows = []
-    if df is None or df.empty:
-        return rows
-
-    for _, r in df.iterrows():
-        stock = int(r.get("stock", 0) or 0)
-        if stock <= 0:
-            status = "Out of Stock"
-        elif stock <= 3:
-            status = "Low Stock"
-        else:
-            status = "In Stock"
-
-        cost = float(r.get("cost_price", 0) or 0)
-        price = float(r.get("price", 0) or 0)
-        rows.append([
-            str(int(r.get("id", 0))),
-            str(r.get("name", "")),
-            str(r.get("variant_label", "") or ""),
-            str(r.get("category", "")),
-            cost,
-            price,
-            price - cost,
-            stock,
-            status,
-        ])
-    return rows
-
-
-def sync_inventory_to_gsheet(max_attempts=3):
-    """Mirror the complete local inventory into a dedicated Google Inventory Log tab.
-
-    The Apps Script replaces the data rows in that tab on each successful sync,
-    so edits, restocks, deletions and stock changes are reflected accurately.
-    The header row is preserved.
-    """
-    if not gsheet_is_configured():
-        return {"configured": False, "ok": False, "updated": 0, "attempts": 0, "error": "Google Sheets is not configured."}
-
-    if not GSHEETS_LIB_AVAILABLE:
-        return {"configured": False, "ok": False, "updated": 0, "attempts": 0, "error": "The requests package is not installed."}
-
-    secret = _gsheet_config("gsheet_webapp_secret", GSHEET_WEBAPP_SECRET) or ""
-    url = _gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, must_be_url=True)
-    if not secret:
-        return {"configured": True, "ok": False, "updated": 0, "attempts": 0, "error": "Google Sheets shared secret is missing."}
-
-    conn = get_connection()
-    try:
-        df = pd.read_sql_query("SELECT * FROM products ORDER BY id ASC", conn)
-    finally:
-        conn.close()
-
-    payload = {
-        "secret": secret,
-        "action": "sync_inventory",
-        "headers": GSHEET_INVENTORY_HEADERS,
-        "rows": _rows_from_inventory_dataframe(df),
-    }
-
-    attempts = max(1, int(max_attempts))
-    last_error = "Unknown Google Inventory sync error."
-
-    for attempt in range(1, attempts + 1):
-        try:
-            resp = requests.post(url, json=payload, timeout=20)
-        except requests.exceptions.RequestException as exc:
-            last_error = f"Network error reaching the Web App: {exc}"
-        else:
-            if resp.status_code != 200:
-                snippet = resp.text[:300].replace("\n", " ")
-                last_error = f"Web App returned HTTP {resp.status_code}. Response started with: {snippet!r}"
-            else:
-                try:
-                    data = resp.json()
-                except ValueError:
-                    snippet = resp.text[:300].replace("\n", " ")
-                    last_error = f"Web App didn't return JSON while syncing inventory. Response started with: {snippet!r}"
-                else:
-                    if data.get("status") == "ok":
-                        return {
-                            "configured": True,
-                            "ok": True,
-                            "updated": int(data.get("updated", 0)),
-                            "attempts": attempt,
-                            "error": None,
-                        }
-                    last_error = data.get("message", "Unknown error from the Web App.")
-
-        if attempt < attempts:
-            import time
-            time.sleep(2 ** (attempt - 1))
-
-    return {
-        "configured": True,
-        "ok": False,
-        "updated": 0,
-        "attempts": attempts,
-        "error": last_error,
-    }
-
-
-def clear_google_sheet(action="clear_sales", max_attempts=3):
-    """Request the Apps Script to remove sales rows from the online sheet.
-
-    Supported actions:
-      - ``clear_sales``: remove all Sales Log rows but keep its header.
-      - ``clear_inventory``: remove all Inventory Log rows but keep its header.
-      - ``clear_all``: remove both Sales Log and Inventory Log data rows.
-
-    The Apps Script must support the requested action. Header rows are
-    preserved so both tabs are ready for the next sync.
-    """
-    if not gsheet_is_configured():
-        return {
-            "configured": False,
-            "ok": False,
-            "attempts": 0,
-            "error": "Google Sheets is not configured.",
-        }
-
-    if not GSHEETS_LIB_AVAILABLE:
-        return {
-            "configured": False,
-            "ok": False,
-            "attempts": 0,
-            "error": "The requests package is not installed.",
-        }
-
-    secret = _gsheet_config("gsheet_webapp_secret", GSHEET_WEBAPP_SECRET) or ""
-    url = _gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, must_be_url=True)
-    if not secret:
-        return {
-            "configured": True,
-            "ok": False,
-            "attempts": 0,
-            "error": "Google Sheets shared secret is missing.",
-        }
-
-    if action not in {"clear_sales", "clear_inventory", "clear_all"}:
-        return {
-            "configured": True,
-            "ok": False,
-            "attempts": 0,
-            "cleared": 0,
-            "error": f"Unsupported Google Sheets clear action: {action}",
-        }
-
-    payload = {"secret": secret, "action": action}
-    attempts = max(1, int(max_attempts))
-    last_error = "Unknown Google Sheets clear error."
-
-    for attempt in range(1, attempts + 1):
-        try:
-            resp = requests.post(url, json=payload, timeout=20)
-        except requests.exceptions.RequestException as exc:
-            last_error = f"Network error reaching the Web App: {exc}"
-        else:
-            if resp.status_code != 200:
-                snippet = resp.text[:300].replace("\n", " ")
-                last_error = (
-                    f"Web App returned HTTP {resp.status_code}. "
-                    f"Response started with: {snippet!r}"
-                )
-            else:
-                try:
-                    data = resp.json()
-                except ValueError:
-                    snippet = resp.text[:300].replace("\n", " ")
-                    last_error = (
-                        "Web App didn't return JSON while clearing Google Sheets. "
-                        f"Response started with: {snippet!r}"
-                    )
-                else:
-                    if data.get("status") == "ok":
-                        return {
-                            "configured": True,
-                            "ok": True,
-                            "attempts": attempt,
-                            "cleared": int(data.get("cleared", 0)),
-                            "error": None,
-                        }
-                    last_error = data.get("message", "Unknown error from the Web App.")
-
-        if attempt < attempts:
-            import time
-            time.sleep(2 ** (attempt - 1))
-
-    return {
-        "configured": True,
-        "ok": False,
-        "attempts": attempts,
-        "cleared": 0,
-        "error": last_error,
-    }
-
-
-def clear_sales_local():
-    """Permanently remove all local sales history while preserving products and cashiers."""
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM sales")
-        cursor.execute("DELETE FROM sqlite_sequence WHERE name = 'sales'")
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def clear_inventory_local():
-    """Permanently remove all products/stock while preserving sales and cashiers."""
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM products")
-        cursor.execute("DELETE FROM sqlite_sequence WHERE name = 'products'")
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def clear_local_data():
-    """Permanently remove all POS data while preserving the database schema."""
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM sales")
-        cursor.execute("DELETE FROM products")
-        cursor.execute("DELETE FROM cashiers")
-        cursor.execute("DELETE FROM sqlite_sequence WHERE name IN ('sales', 'products', 'cashiers')")
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def clear_sales_everywhere():
-    """Clear sales from Google Sheets first, then delete local sales history."""
-    if gsheet_is_configured():
-        cloud_result = clear_google_sheet(action="clear_sales", max_attempts=3)
-        if not cloud_result.get("ok"):
-            return {
-                "ok": False,
-                "cloud_ok": False,
-                "error": "Google Sheet sales were not cleared, so local sales history was kept safe. "
-                         + (cloud_result.get("error") or "Unknown Google Sheets error."),
-            }
-    else:
-        cloud_result = {"ok": True, "cleared": 0, "skipped": True}
-
-    try:
-        clear_sales_local()
-    except Exception as exc:
-        return {
-            "ok": False,
-            "cloud_ok": True,
-            "error": f"Google Sheet sales were cleared, but local sales could not be cleared: {exc}",
-        }
-
-    return {
-        "ok": True,
-        "cloud_ok": True,
-        "cloud_cleared": int(cloud_result.get("cleared", 0) or 0),
-        "error": None,
-    }
-
-
-def clear_inventory():
-    """Clear inventory from Google first, then local products/stock.
-
-    Sales history and cashiers are preserved. If the online inventory tab
-    cannot be cleared, local inventory is kept safe.
-    """
-    if gsheet_is_configured():
-        cloud_result = clear_google_sheet(action="clear_inventory", max_attempts=3)
-        if not cloud_result.get("ok"):
-            return {
-                "ok": False,
-                "cloud_ok": False,
-                "error": "Google Inventory Log was not cleared, so local inventory was kept safe. "
-                         + (cloud_result.get("error") or "Unknown Google Sheets error."),
-            }
-    else:
-        cloud_result = {"ok": True, "cleared": 0, "skipped": True}
-
-    try:
-        clear_inventory_local()
-    except Exception as exc:
-        return {
-            "ok": False,
-            "cloud_ok": True,
-            "error": f"Google Inventory Log was cleared, but local inventory could not be cleared: {exc}",
-        }
-
-    return {
-        "ok": True,
-        "cloud_ok": True,
-        "cloud_cleared": int(cloud_result.get("cleared", 0) or 0),
-        "error": None,
-    }
-
-
-def clear_everything():
-    """Clear both the online Google Sheet and the local POS database.
-
-    Local data is only deleted after the Google Sheet clear succeeds, preventing
-    the most dangerous partial-clear case.
-    """
-    if gsheet_is_configured():
-        cloud_result = clear_google_sheet(max_attempts=3)
-        if not cloud_result.get("ok"):
-            return {
-                "ok": False,
-                "cloud_ok": False,
-                "error": "Google Sheet was not cleared, so local POS data was kept safe. "
-                         + (cloud_result.get("error") or "Unknown Google Sheets error."),
-            }
-    else:
-        cloud_result = {"ok": True, "cleared": 0, "skipped": True}
-
-    try:
-        clear_local_data()
-    except Exception as exc:
-        return {
-            "ok": False,
-            "cloud_ok": True,
-            "error": f"Google Sheet was cleared, but the local database could not be cleared: {exc}",
-        }
-
-    return {
-        "ok": True,
-        "cloud_ok": True,
-        "cloud_cleared": int(cloud_result.get("cleared", 0) or 0),
-        "error": None,
-    }
-
-
-def reset_runtime_state_after_clear():
-    """Reset Streamlit state so no old cart/report/receipt data remains visible."""
-    st.session_state.cart = []
-    st.session_state.selected_category = "All"
-    st.session_state.active_cashier = ""
-    st.session_state.last_receipt = None
-    st.session_state.confirm_delete_product = None
-    st.session_state.gsheet_last_manual_sync = None
-    st.session_state.pop("gsheet_sync_status", None)
-    st.session_state.pop("inventory_sync_status", None)
-    st.session_state.pop("checkout_feedback", None)
-    st.session_state.pop("add_product_feedback", None)
-    st.session_state["clear_everything_confirm"] = ""
-    st.session_state["show_clear_everything_confirm"] = False
-    st.session_state["clear_sales_confirm"] = ""
-    st.session_state["show_clear_sales_confirm"] = False
-    st.session_state["clear_inventory_confirm"] = ""
-    st.session_state["show_clear_inventory_confirm"] = False
-
-
-def _get_app_setting(key):
-    """Read a small persistent app setting from SQLite."""
-    conn = get_connection()
-    try:
-        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
-        return row[0] if row else None
-    finally:
-        conn.close()
-
-
-def _set_app_setting(key, value):
-    """Write a small persistent app setting to SQLite."""
-    conn = get_connection()
-    try:
-        conn.execute(
-            "INSERT INTO app_settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, str(value)),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def initialize_daily_recording_mode():
-    """Apply the requested clean-start and daily sales reset rules.
-
-    First run after this version is installed:
-      * Clear local sales, products, and cashiers.
-      * Clear Google Sales Log and Google Inventory Log.
-      * Mark the clean start as completed so normal app restarts do not erase inventory.
-
-    Every later calendar day:
-      * Clear only sales locally and in Google Sales Log.
-      * Keep inventory and cashiers untouched.
-
-    If Google Sheets is configured but cannot be cleared, local data is kept safe
-    and the reset is retried on the next app run.
-    """
-    fresh_done = _get_app_setting(FRESH_START_KEY)
-    today_text = date.today().isoformat()
-
-    if fresh_done != DAILY_RECORDING_VERSION:
-        # The user's requested initial state is completely blank inventory and
-        # cashier lists. Clear the online copies first so we never knowingly
-        # leave the two stores out of sync.
-        if gsheet_is_configured():
-            cloud_result = clear_google_sheet(action="clear_all", max_attempts=3)
-            if not cloud_result.get("ok"):
-                st.warning(
-                    "Daily recording setup could not clear the Google Sales/Inventory sheets yet. "
-                    "Your existing local data was kept safe. The reset will be retried automatically."
-                )
-                return False
-
-        try:
-            clear_local_data()
-        except Exception as exc:
-            st.warning(f"The initial clean setup could not finish: {exc}")
-            return False
-
-        _set_app_setting(FRESH_START_KEY, DAILY_RECORDING_VERSION)
-        _set_app_setting(LAST_SALES_DAY_KEY, today_text)
-        st.session_state["daily_reset_message"] = (
-            "System started with a clean Inventory, Cashier list, and Sales record. "
-            "From tomorrow onward, only Sales will reset automatically; Inventory and Cashiers will remain."
-        )
-        return True
-
-    last_sales_day = _get_app_setting(LAST_SALES_DAY_KEY)
-    if last_sales_day != today_text:
-        # New day: only the sales record is renewed. Inventory and cashiers stay.
-        if gsheet_is_configured():
-            cloud_result = clear_google_sheet(action="clear_sales", max_attempts=3)
-            if not cloud_result.get("ok"):
-                st.warning(
-                    "A new day was detected, but Google Sales Log could not be cleared yet. "
-                    "Local sales were kept safe and the reset will be retried automatically."
-                )
-                return False
-
-        try:
-            clear_sales_local()
-        except Exception as exc:
-            st.warning(f"The new-day sales reset could not finish: {exc}")
-            return False
-
-        _set_app_setting(LAST_SALES_DAY_KEY, today_text)
-        st.session_state["daily_reset_message"] = (
-            f"New day started ({today_text}). Sales were reset for today's recording. "
-            "Inventory and Cashiers were kept."
-        )
-        # Remove any stale transaction/session data from the previous day.
-        reset_runtime_state_after_clear()
-        return True
-
-    return True
-
-
+# ============================================================
+# DATABASE
+# ============================================================
 def get_connection():
-    conn = sqlite3.connect("inventory.db")
+    conn = sqlite3.connect(DB_FILE)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def init_db():
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS app_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            variant_label TEXT DEFAULT '',
-            category TEXT,
-            cost_price REAL DEFAULT 0,
-            price REAL,
-            stock INTEGER
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS cashiers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sales (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            receipt_id TEXT,
-            product_name TEXT,
-            quantity INTEGER,
-            unit_cost REAL DEFAULT 0,
-            unit_price REAL DEFAULT 0,
-            discount_amount REAL DEFAULT 0,
-            total_price REAL,
-            payment_method TEXT,
-            cashier TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    cur = conn.cursor()
 
-    # If products still has the old UNIQUE(name) constraint from an earlier
-    # version, rebuild the table without it so the same product name can be
-    # stocked more than once (e.g. sold at different markups/price tiers).
-    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='products'")
-    row = cursor.fetchone()
-    if row and row[0] and "UNIQUE" in row[0]:
-        cursor.execute("PRAGMA table_info(products)")
-        old_cols = [c[1] for c in cursor.fetchall()]
-        cursor.execute("ALTER TABLE products RENAME TO products_old")
-        cursor.execute("""
-            CREATE TABLE products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT,
-                variant_label TEXT DEFAULT '',
-                category TEXT,
-                cost_price REAL DEFAULT 0,
-                price REAL,
-                stock INTEGER
-            )
-        """)
-        cost_select = "cost_price" if "cost_price" in old_cols else "0"
-        variant_select = "variant_label" if "variant_label" in old_cols else "''"
-        cursor.execute(f"""
-            INSERT INTO products (id, name, variant_label, category, cost_price, price, stock)
-            SELECT id, name, {variant_select}, category, {cost_select}, price, stock FROM products_old
-        """)
-        cursor.execute("DROP TABLE products_old")
+    cur.execute("""CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL
+    )""")
 
-    # Auto-migrations for columns added after the tables already existed.
-    cursor.execute("PRAGMA table_info(sales)")
-    sales_columns = [column[1] for column in cursor.fetchall()]
-    if "receipt_id" not in sales_columns:
-        cursor.execute("ALTER TABLE sales ADD COLUMN receipt_id TEXT")
-    if "discount_amount" not in sales_columns:
-        cursor.execute("ALTER TABLE sales ADD COLUMN discount_amount REAL DEFAULT 0")
-    if "unit_price" not in sales_columns:
-        cursor.execute("ALTER TABLE sales ADD COLUMN unit_price REAL DEFAULT 0")
-    if "unit_cost" not in sales_columns:
-        cursor.execute("ALTER TABLE sales ADD COLUMN unit_cost REAL DEFAULT 0")
+    # Existing inventory/sales tables are retained for compatibility with the user's app.
+    cur.execute("""CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        variant_label TEXT DEFAULT '',
+        category TEXT,
+        cost_price REAL DEFAULT 0,
+        price REAL DEFAULT 0,
+        stock INTEGER DEFAULT 0
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS cashiers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS sales (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        receipt_id TEXT,
+        product_name TEXT,
+        quantity INTEGER,
+        unit_cost REAL DEFAULT 0,
+        unit_price REAL DEFAULT 0,
+        discount_amount REAL DEFAULT 0,
+        total_price REAL DEFAULT 0,
+        payment_method TEXT,
+        cashier TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
 
-    cursor.execute("PRAGMA table_info(products)")
-    product_columns = [column[1] for column in cursor.fetchall()]
-    if "cost_price" not in product_columns:
-        cursor.execute("ALTER TABLE products ADD COLUMN cost_price REAL DEFAULT 0")
-    if "variant_label" not in product_columns:
-        cursor.execute("ALTER TABLE products ADD COLUMN variant_label TEXT DEFAULT ''")
+    # Phone repair tables.
+    cur.execute("""CREATE TABLE IF NOT EXISTS customers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        phone TEXT DEFAULT '',
+        email TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS repair_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_ref TEXT UNIQUE NOT NULL,
+        customer_id INTEGER,
+        customer_name TEXT NOT NULL,
+        customer_phone TEXT DEFAULT '',
+        device_type TEXT DEFAULT 'Smartphone',
+        brand TEXT DEFAULT '',
+        model TEXT DEFAULT '',
+        imei_serial TEXT DEFAULT '',
+        device_condition TEXT DEFAULT '',
+        customer_issue TEXT DEFAULT '',
+        diagnosis TEXT DEFAULT '',
+        repair_notes TEXT DEFAULT '',
+        technician TEXT DEFAULT '',
+        status TEXT DEFAULT 'Received',
+        quoted_amount REAL DEFAULT 0,
+        deposit_amount REAL DEFAULT 0,
+        paid_amount REAL DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        ready_at DATETIME,
+        collected_at DATETIME,
+        FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE SET NULL
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS repair_job_parts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repair_job_id INTEGER NOT NULL,
+        product_id INTEGER,
+        product_name TEXT NOT NULL,
+        quantity INTEGER DEFAULT 1,
+        unit_cost REAL DEFAULT 0,
+        unit_price REAL DEFAULT 0,
+        FOREIGN KEY(repair_job_id) REFERENCES repair_jobs(id) ON DELETE CASCADE,
+        FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE SET NULL
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS repair_payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repair_job_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        payment_method TEXT NOT NULL,
+        cashier TEXT DEFAULT '',
+        reference TEXT DEFAULT '',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(repair_job_id) REFERENCES repair_jobs(id) ON DELETE CASCADE
+    )""")
+
+    # Safe migrations for old databases.
+    for table, additions in {
+        "products": {
+            "variant_label": "TEXT DEFAULT ''", "cost_price": "REAL DEFAULT 0", "price": "REAL DEFAULT 0", "stock": "INTEGER DEFAULT 0"
+        },
+        "sales": {
+            "receipt_id": "TEXT", "unit_cost": "REAL DEFAULT 0", "unit_price": "REAL DEFAULT 0", "discount_amount": "REAL DEFAULT 0"
+        },
+        "repair_jobs": {
+            "device_condition": "TEXT DEFAULT ''", "diagnosis": "TEXT DEFAULT ''", "repair_notes": "TEXT DEFAULT ''",
+            "technician": "TEXT DEFAULT ''", "deposit_amount": "REAL DEFAULT 0", "paid_amount": "REAL DEFAULT 0",
+            "ready_at": "DATETIME", "collected_at": "DATETIME"
+        }
+    }.items():
+        cur.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cur.fetchall()}
+        for col, definition in additions.items():
+            if col not in existing:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
 
     conn.commit()
     conn.close()
 
 
 init_db()
-initialize_daily_recording_mode()
+
+# ============================================================
+# HELPERS
+# ============================================================
+def money(v):
+    return f"${float(v or 0):,.2f}"
 
 
-# ---------------------------------------------------------
-# RECEIPT GENERATION
-# ---------------------------------------------------------
-def generate_receipt_docx(receipt_id, cashier_name, pay_method, cart_items, subtotal_amount, discount_amount, total_amount, discount_label=""):
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def generate_ref(prefix="JOB"):
+    return f"{prefix}-{datetime.now().strftime('%y%m%d')}-{random.randint(1000, 9999)}"
+
+
+def get_setting(key, default=None):
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+    finally:
+        conn.close()
+
+
+def set_setting(key, value):
+    conn = get_connection()
+    try:
+        conn.execute("INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def status_label(status):
+    return status
+
+
+def get_cashiers():
+    conn = get_connection()
+    try:
+        return pd.read_sql_query("SELECT * FROM cashiers ORDER BY name", conn)
+    finally:
+        conn.close()
+
+
+def gsheet_config(key, fallback, url=False):
+    try:
+        val = st.secrets.get(key)
+    except Exception:
+        val = None
+    val = val or fallback
+    if not val:
+        return None
+    val = str(val).strip()
+    if url and not val.startswith(("https://", "http://")):
+        return None
+    return val
+
+
+def gsheet_is_configured():
+    return GSHEETS_LIB_AVAILABLE and bool(gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, True))
+
+
+def gsheet_url():
+    return gsheet_config("gsheet_share_url", GSHEET_SHARE_URL, True)
+
+
+def post_gsheet(payload, attempts=3):
+    if not gsheet_is_configured():
+        return {"configured": False, "ok": False, "error": None, "added": 0, "updated": 0}
+    secret = gsheet_config("gsheet_webapp_secret", GSHEET_WEBAPP_SECRET) or ""
+    url = gsheet_config("gsheet_webapp_url", GSHEET_WEBAPP_URL, True)
+    payload = dict(payload)
+    payload["secret"] = secret
+    last_error = "Unknown Google Sheets error."
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.post(url, json=payload, timeout=20)
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}: {response.text[:250]}"
+            else:
+                try:
+                    data = response.json()
+                except ValueError:
+                    last_error = f"Web App did not return JSON: {response.text[:250]}"
+                else:
+                    if data.get("status") == "ok":
+                        data.update({"configured": True, "attempts": attempt})
+                        return data
+                    last_error = data.get("message", "Unknown Web App error.")
+        except requests.exceptions.RequestException as exc:
+            last_error = str(exc)
+        if attempt < attempts:
+            time.sleep(2 ** (attempt - 1))
+    return {"configured": True, "ok": False, "attempts": attempts, "error": last_error, "added": 0, "updated": 0}
+
+
+def sync_sales_to_gsheet(df):
+    if df is None or df.empty:
+        return {"configured": True, "ok": True, "added": 0}
+    rows = []
+    for _, r in df.iterrows():
+        qty = int(r.get("quantity", 0) or 0)
+        cost = float(r.get("unit_cost", 0) or 0)
+        total = float(r.get("total_price", 0) or 0)
+        rows.append([
+            str(int(r.get("id", 0))), str(r.get("timestamp", "")), str(r.get("receipt_id", "")),
+            str(r.get("product_name", "")), qty, cost, float(r.get("unit_price", 0) or 0),
+            float(r.get("discount_amount", 0) or 0), total, total - cost * qty,
+            str(r.get("payment_method", "")), str(r.get("cashier", ""))
+        ])
+    return post_gsheet({"headers": GSHEET_HEADERS, "rows": rows})
+
+
+def sync_inventory_to_gsheet():
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query("SELECT * FROM products ORDER BY id", conn)
+    finally:
+        conn.close()
+    rows = []
+    for _, r in df.iterrows():
+        stock = int(r.get("stock", 0) or 0)
+        status = "Out of Stock" if stock <= 0 else ("Low Stock" if stock <= 3 else "In Stock")
+        cost = float(r.get("cost_price", 0) or 0)
+        price = float(r.get("price", 0) or 0)
+        rows.append([str(int(r["id"])), str(r.get("name", "")), str(r.get("variant_label", "") or ""), str(r.get("category", "")), cost, price, price-cost, stock, status])
+    return post_gsheet({"action": "sync_inventory", "headers": GSHEET_INVENTORY_HEADERS, "rows": rows})
+
+
+def clear_google(action):
+    return post_gsheet({"action": action})
+
+
+def create_receipt_docx(title, ref, customer, device, items, total, paid, balance, cashier, payment_method):
     doc = Document()
-
     for section in doc.sections:
-        section.top_margin = Inches(0.5)
-        section.bottom_margin = Inches(0.5)
-        section.left_margin = Inches(0.5)
-        section.right_margin = Inches(0.5)
-
-    title_p = doc.add_paragraph()
-    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run_title = title_p.add_run("SALES RECEIPT\n")
-    run_title.bold = True
-    run_title.font.size = Pt(18)
-    run_sub = title_p.add_run("Point of Sale System\n")
-    run_sub.font.size = Pt(11)
-    run_sub.font.color.rgb = RGBColor(120, 120, 120)
-
-    doc.add_paragraph("-" * 100)
-
-    meta_p = doc.add_paragraph()
-    meta_p.add_run("Receipt Ref: ").bold = True
-    meta_p.add_run(f"{receipt_id}\n")
-    meta_p.add_run("Date & Time: ").bold = True
-    meta_p.add_run(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-    meta_p.add_run("Cashier: ").bold = True
-    meta_p.add_run(f"{cashier_name}\n")
-    meta_p.add_run("Payment Method: ").bold = True
-    meta_p.add_run(f"{pay_method}\n")
-
-    table = doc.add_table(rows=1, cols=4)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    hdr_cells = table.rows[0].cells
-    headers = ['Item Description', 'Unit Price', 'Qty', 'Subtotal']
-    for i, header_text in enumerate(headers):
-        hdr_cells[i].text = header_text
-        hdr_cells[i].paragraphs[0].runs[0].font.bold = True
-
-    for item in cart_items:
-        row_cells = table.add_row().cells
-        subtotal = item['Quantity'] * item['Unit Price ($)']
-        row_cells[0].text = str(item['Product Name'])
-        row_cells[1].text = f"${item['Unit Price ($)']:.2f}"
-        row_cells[2].text = str(item['Quantity'])
-        row_cells[3].text = f"${subtotal:.2f}"
-
-    doc.add_paragraph("-" * 100)
-
-    subtotal_p = doc.add_paragraph()
-    subtotal_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    subtotal_p.add_run(f"Subtotal: ${subtotal_amount:.2f}")
-
-    if discount_amount > 0:
-        discount_p = doc.add_paragraph()
-        discount_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        label = f"Discount ({discount_label}): " if discount_label else "Discount: "
-        run_discount = discount_p.add_run(f"{label}-${discount_amount:.2f}")
-        run_discount.font.color.rgb = RGBColor(180, 0, 0)
-
-    total_p = doc.add_paragraph()
-    total_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run_total = total_p.add_run(f"TOTAL AMOUNT: ${total_amount:.2f}")
-    run_total.bold = True
-    run_total.font.size = Pt(15)
-
-    footer_p = doc.add_paragraph()
-    footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run_foot = footer_p.add_run("\nThank you for your purchase!")
-    run_foot.font.italic = True
-    run_foot.font.size = Pt(10)
-
-    target_stream = io.BytesIO()
-    doc.save(target_stream)
-    return target_stream.getvalue()
+        section.top_margin = Inches(0.5); section.bottom_margin = Inches(0.5)
+        section.left_margin = Inches(0.5); section.right_margin = Inches(0.5)
+    p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run("PHONE REPAIR SHOP\n"); r.bold = True; r.font.size = Pt(18)
+    r = p.add_run(title); r.font.size = Pt(11)
+    doc.add_paragraph("-" * 90)
+    p = doc.add_paragraph()
+    p.add_run("Reference: ").bold = True; p.add_run(f"{ref}\n")
+    p.add_run("Date & Time: ").bold = True; p.add_run(f"{now_text()}\n")
+    p.add_run("Customer: ").bold = True; p.add_run(f"{customer}\n")
+    p.add_run("Device: ").bold = True; p.add_run(f"{device}\n")
+    p.add_run("Cashier/Technician: ").bold = True; p.add_run(f"{cashier}\n")
+    p.add_run("Payment: ").bold = True; p.add_run(f"{payment_method}\n")
+    table = doc.add_table(rows=1, cols=3)
+    for i, h in enumerate(["Description", "Qty", "Amount"]):
+        table.rows[0].cells[i].text = h
+    for name, qty, amount in items:
+        row = table.add_row().cells
+        row[0].text = str(name); row[1].text = str(qty); row[2].text = money(amount)
+    doc.add_paragraph("-" * 90)
+    p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    p.add_run(f"TOTAL: {money(total)}\n").bold = True
+    p.add_run(f"PAID: {money(paid)}\n")
+    p.add_run(f"BALANCE: {money(balance)}\n").bold = True
+    p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.add_run("Thank you for choosing our repair service!").italic = True
+    out = io.BytesIO(); doc.save(out); return out.getvalue()
 
 
-def _save_new_product():
-    """on_click callback for the Add Product button.
+def export_excel(df, sheet_name="Report"):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+        ws = writer.sheets[sheet_name[:31]]
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+        thin = Border(left=Side(style="thin", color="D9D9D9"), right=Side(style="thin", color="D9D9D9"), top=Side(style="thin", color="D9D9D9"), bottom=Side(style="thin", color="D9D9D9"))
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(1, c); cell.font = header_font; cell.fill = header_fill; cell.alignment = Alignment(horizontal="center"); cell.border = thin
+            width = max(len(str(ws.cell(1,c).value or "")), *(len(str(ws.cell(r,c).value or "")) for r in range(2, min(ws.max_row, 200)+1))) + 3
+            ws.column_dimensions[get_column_letter(c)].width = min(max(width, 12), 35)
+            for r in range(2, ws.max_row+1): ws.cell(r,c).border = thin
+        ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
+    return buf.getvalue()
 
-    Runs BEFORE the widgets are re-instantiated on the next script run, so
-    it's the safe place to both save the product and clear the input
-    fields (resetting st.session_state for a widget's key AFTER that widget
-    has already been drawn in the same run raises a StreamlitAPIException).
-    """
-    name = st.session_state.get("add_p_name", "").strip()
-    variant = st.session_state.get("add_p_variant", "").strip()
-    cat = st.session_state.get("add_p_cat", CATEGORIES[0])
-    cost = st.session_state.get("add_p_cost", 0.0)
-    markup = st.session_state.get("add_p_markup", 0.0)
-    stock = st.session_state.get("add_p_stock", 0)
-    price = cost + markup
+# ============================================================
+# DAILY CASH SALES RESET - REPAIR JOBS NEVER RESET
+# ============================================================
+def daily_sales_reset():
+    key = "phone_shop_last_sales_day"
+    today = date.today().isoformat()
+    last = get_setting(key)
+    if last and last != today:
+        conn = get_connection()
+        try:
+            conn.execute("DELETE FROM sales")
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='sales'")
+            conn.commit()
+        finally:
+            conn.close()
+    if last != today:
+        set_setting(key, today)
 
-    if not name:
-        st.session_state["add_product_feedback"] = ("error", "Product name cannot be empty.")
-        return
+daily_sales_reset()
 
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id FROM products WHERE name = ? AND price = ? AND IFNULL(variant_label, '') = ?",
-        (name, price, variant),
-    )
-    existing = cursor.fetchone()
-
-    if existing:
-        cursor.execute(
-            "UPDATE products SET category = ?, cost_price = ?, stock = stock + ? WHERE id = ?",
-            (cat, cost, stock, existing[0]),
-        )
-        conn.commit()
-        conn.close()
-        st.session_state["add_product_feedback"] = (
-            "success", f"'{name}' already existed at this price/tier — restocked by {stock} units."
-        )
-    else:
-        cursor.execute(
-            "INSERT INTO products (name, variant_label, category, cost_price, price, stock) VALUES (?, ?, ?, ?, ?, ?)",
-            (name, variant, cat, cost, price, stock),
-        )
-        conn.commit()
-        conn.close()
-        st.session_state["add_product_feedback"] = ("success", f"Inventory record for '{name}' created.")
-
-    # Safe here (pre-rerun) — clears the form for the next entry.
-    st.session_state["add_p_name"] = ""
-    st.session_state["add_p_variant"] = ""
-    st.session_state["add_p_cost"] = 0.0
-    st.session_state["add_p_markup"] = 0.0
-    st.session_state["add_p_stock"] = 0
-
-    if gsheet_is_configured():
-        st.session_state["inventory_sync_status"] = sync_inventory_to_gsheet()
-
-
-def _complete_transaction():
-    """on_click callback for the Complete Transaction button.
-
-    Runs BEFORE the widgets are re-instantiated on the next script run, so
-    it's the safe place to clear the cart and reset the discount fields
-    (resetting st.session_state for a widget's key AFTER that widget has
-    already been drawn in the same run raises a StreamlitAPIException).
-    """
-    if not st.session_state.cart:
-        st.session_state["checkout_feedback"] = ("error", "Cart contains no items.")
-        return
-
-    pay_method = st.session_state.get("checkout_pay_method", PAYMENT_METHODS[0])
-    discount_type = st.session_state.get("discount_type", "None")
-    discount_value = st.session_state.get("discount_value", 0.0)
-
-    subtotal = sum(item["Quantity"] * item["Unit Price ($)"] for item in st.session_state.cart)
-
-    if discount_type == "Percentage (%)":
-        discount_value = min(discount_value, 100.0)
-        discount_amount = subtotal * (discount_value / 100.0)
-        discount_label = f"{discount_value:.0f}%"
-    elif discount_type == "Fixed Amount ($)":
-        discount_amount = min(discount_value, subtotal)
-        discount_label = "fixed"
-    else:
-        discount_amount = 0.0
-        discount_label = ""
-
-    grand_total = max(0.0, subtotal - discount_amount)
-
-    # Re-verify current stock right before committing the sale, in case it
-    # changed since items were added to the cart.
-    conn = get_connection()
-    cursor = conn.cursor()
-    stock_problem = None
-    product_costs = {}
-    for item in st.session_state.cart:
-        cursor.execute("SELECT stock, cost_price FROM products WHERE id = ?", (item['id'],))
-        row = cursor.fetchone()
-        current_stock = row[0] if row else 0
-        product_costs[item['id']] = row[1] if row and row[1] is not None else 0.0
-        if item['Quantity'] > current_stock:
-            stock_problem = f"{item['Product Name']} only has {current_stock} left in stock."
-            break
-
-    if stock_problem:
-        conn.close()
-        st.session_state["checkout_feedback"] = ("error", f"⚠️ {stock_problem} Please adjust the quantity.")
-        return
-
-    receipt_id = f"REF-{random.randint(100000, 999999)}"
-    # Spread the discount across line items proportionally to their share of
-    # the subtotal, so per-line and reporting totals still add up to the
-    # discounted total.
-    for item in st.session_state.cart:
-        item_subtotal = item['Quantity'] * item['Unit Price ($)']
-        item_discount_share = discount_amount * (item_subtotal / subtotal) if subtotal > 0 else 0.0
-        item_total = item_subtotal - item_discount_share
-        cursor.execute(
-            """INSERT INTO sales (receipt_id, product_name, quantity, unit_cost, unit_price, discount_amount, total_price, payment_method, cashier)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                receipt_id,
-                item['Product Name'],
-                item['Quantity'],
-                product_costs.get(item['id'], 0.0),
-                item['Unit Price ($)'],
-                item_discount_share,
-                item_total,
-                pay_method,
-                st.session_state.active_cashier,
-            )
-        )
-        cursor.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (item['Quantity'], item['id']))
-
-    conn.commit()
-
-    # Grab the rows we just inserted (before closing) so we can push them to
-    # Google Sheets in the same shape as the Excel export.
-    new_sale_rows_df = None
-    if gsheet_is_configured():
-        cursor.execute("SELECT * FROM sales WHERE receipt_id = ?", (receipt_id,))
-        cols = [d[0] for d in cursor.description]
-        new_sale_rows_df = pd.DataFrame(cursor.fetchall(), columns=cols)
-
-    conn.close()
-
-    if new_sale_rows_df is not None:
-        sync_result = sync_dataframe_to_gsheet(new_sale_rows_df)
-        st.session_state["gsheet_sync_status"] = sync_result
-
-    # Keep the dedicated Google Inventory Log synchronized with stock changes
-    # caused by this sale. A failure here does not undo the completed sale;
-    # Admin can use the manual inventory sync to retry.
-    if gsheet_is_configured():
-        st.session_state["inventory_sync_status"] = sync_inventory_to_gsheet()
-
-    docx_bytes = generate_receipt_docx(
-        receipt_id, st.session_state.active_cashier, pay_method, st.session_state.cart,
-        subtotal, discount_amount, grand_total, discount_label,
-    )
-    st.session_state.last_receipt = {"id": receipt_id, "docx_data": docx_bytes}
-    st.session_state.cart = []
-    # Safe here (pre-rerun) — clears the discount for the next transaction.
-    st.session_state["discount_type"] = "None"
-    st.session_state["discount_value"] = 0.0
-    st.session_state["checkout_feedback"] = None
-
-
-# ---------------------------------------------------------
+# ============================================================
 # SESSION STATE
-# ---------------------------------------------------------
-if "cart" not in st.session_state:
-    st.session_state.cart = []
-if "selected_category" not in st.session_state:
-    st.session_state.selected_category = "All"
-if "active_cashier" not in st.session_state:
-    st.session_state.active_cashier = ""
-if "last_receipt" not in st.session_state:
-    st.session_state.last_receipt = None
-if "confirm_delete_product" not in st.session_state:
-    st.session_state.confirm_delete_product = None
-if "gsheet_last_manual_sync" not in st.session_state:
-    st.session_state.gsheet_last_manual_sync = None
-if "show_clear_everything_confirm" not in st.session_state:
-    st.session_state.show_clear_everything_confirm = False
-if "clear_everything_confirm" not in st.session_state:
-    st.session_state.clear_everything_confirm = ""
-if "show_clear_sales_confirm" not in st.session_state:
-    st.session_state.show_clear_sales_confirm = False
-if "clear_sales_confirm" not in st.session_state:
-    st.session_state.clear_sales_confirm = ""
-if "show_clear_inventory_confirm" not in st.session_state:
-    st.session_state.show_clear_inventory_confirm = False
-if "clear_inventory_confirm" not in st.session_state:
-    st.session_state.clear_inventory_confirm = ""
-if "daily_reset_message" not in st.session_state:
-    st.session_state.daily_reset_message = None
+# ============================================================
+DEFAULTS = {
+    "cashier": "", "last_receipt": None, "job_receipt": None,
+    "admin_authenticated": False, "repair_filter": "All"
+}
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
-if st.session_state.daily_reset_message:
-    st.info(f"📅 {st.session_state.daily_reset_message}")
-    st.session_state.daily_reset_message = None
-
-# ---------------------------------------------------------
+# ============================================================
 # SIDEBAR
-# ---------------------------------------------------------
-st.sidebar.markdown("### 🧾 POS System")
-st.sidebar.caption("Daily sales recording • Inventory & cashiers persist")
-role = st.sidebar.radio(
-    "Navigation",
-    ["🛒 Cashier Terminal", "📦 Stock Inventory", "📊 Admin Dashboard"],
-    label_visibility="collapsed",
-)
+# ============================================================
+st.sidebar.markdown("### 📱 Phone Repair Shop")
+st.sidebar.caption("Repair jobs • Parts inventory • Daily payments")
+role = st.sidebar.radio("Navigation", [
+    "🔧 Repair Jobs", "💳 Sales / Payments", "📦 Parts Inventory", "📊 Reports", "🔐 Admin"
+], label_visibility="collapsed")
 
-# ---------------------------------------------------------
-# VIEW 1: CASHIER TERMINAL
-# ---------------------------------------------------------
-if role == "🛒 Cashier Terminal":
+cashiers_df = get_cashiers()
+cashier_names = cashiers_df["name"].tolist() if not cashiers_df.empty else []
+if role != "🔐 Admin":
+    if cashier_names:
+        idx = cashier_names.index(st.session_state.cashier) if st.session_state.cashier in cashier_names else 0
+        st.sidebar.selectbox("Staff", cashier_names, index=idx, key="cashier")
+    else:
+        st.sidebar.text_input("Staff Name", key="cashier", value="Staff")
+
+# ============================================================
+# REPAIR JOBS
+# ============================================================
+if role == "🔧 Repair Jobs":
+    st.title("🔧 Repair Jobs")
+    st.caption("Receive phones, track diagnosis and repair progress, record deposits/payments, and close jobs when collected.")
+
     conn = get_connection()
-    df_products = pd.read_sql_query("SELECT * FROM products", conn)
-    df_cashiers = pd.read_sql_query("SELECT name FROM cashiers", conn)
+    jobs_count = conn.execute("SELECT COUNT(*) FROM repair_jobs WHERE status NOT IN ('Collected','Cancelled')").fetchone()[0]
+    ready_count = conn.execute("SELECT COUNT(*) FROM repair_jobs WHERE status='Ready for Collection'").fetchone()[0]
+    balance_total = conn.execute("SELECT COALESCE(SUM(quoted_amount-paid_amount),0) FROM repair_jobs WHERE status NOT IN ('Collected','Cancelled')").fetchone()[0]
     conn.close()
+    m1,m2,m3 = st.columns(3)
+    m1.metric("Open Jobs", jobs_count); m2.metric("Ready for Collection", ready_count); m3.metric("Outstanding Balance", money(balance_total))
 
-    cashier_list = df_cashiers['name'].tolist() if not df_cashiers.empty else []
+    tab_new, tab_jobs = st.tabs(["➕ New Repair Job", "📋 Repair Job List"])
+    with tab_new:
+        st.markdown("#### Customer & Device")
+        c1,c2 = st.columns(2)
+        with c1:
+            customer_name = st.text_input("Customer Name *", key="new_customer_name")
+            customer_phone = st.text_input("Customer Phone", key="new_customer_phone")
+            customer_email = st.text_input("Customer Email", key="new_customer_email")
+        with c2:
+            device_type = st.selectbox("Device Type", DEVICE_TYPES, key="new_device_type")
+            brand = st.text_input("Brand", placeholder="Apple, Samsung, Tecno, Infinix...", key="new_brand")
+            model = st.text_input("Model", key="new_model")
+        imei = st.text_input("IMEI / Serial Number", key="new_imei")
+        condition = st.text_area("Device Condition / Accessories", placeholder="Cracked glass, scratches, charger left with device, etc.", key="new_condition")
+        issue = st.text_area("Customer's Reported Problem *", placeholder="Phone won't charge, broken screen, no power...", key="new_issue")
+        quoted = st.number_input("Quoted Repair Price ($)", min_value=0.0, step=1.0, format="%.2f", key="new_quoted")
+        deposit = st.number_input("Deposit / Initial Payment ($)", min_value=0.0, max_value=float(quoted), step=1.0, format="%.2f", key="new_deposit")
+        tech = st.text_input("Technician", value=st.session_state.get("cashier", ""), key="new_technician")
+        notes = st.text_area("Initial Notes", key="new_notes")
 
-    top_col1, top_col2 = st.columns([3, 1])
-    with top_col1:
-        st.title("🛒 Cashier Terminal")
-    with top_col2:
-        if cashier_list:
-            default_idx = (
-                cashier_list.index(st.session_state.active_cashier)
-                if st.session_state.active_cashier in cashier_list
-                else 0
-            )
-            st.session_state.active_cashier = st.selectbox("Active Cashier", cashier_list, index=default_idx)
-        else:
-            st.session_state.active_cashier = st.text_input("Cashier Name", value="Default Cashier")
-
-    st.divider()
-
-    if st.session_state.last_receipt:
-        st.success(f"✅ Transaction completed. Reference: #{st.session_state.last_receipt['id']}")
-        sync_status = st.session_state.pop("gsheet_sync_status", None)
-        if sync_status and sync_status.get("configured") and not sync_status.get("ok"):
-            st.caption(
-                f"⚠️ Couldn't sync this sale to Google Sheets after {sync_status.get('attempts', 1)} attempt(s): "
-                f"{sync_status.get('error')}. It's still saved locally — use **Sync Now** on the Admin Dashboard to retry."
-            )
-        elif sync_status and sync_status.get("ok") and sync_status.get("added", 0) > 0:
-            st.caption(
-                f"☁️ Synced to the shared Google Sheet ({sync_status.get('added', 0)} row(s), "
-                f"{sync_status.get('attempts', 1)} attempt(s))."
-            )
-        rc_col1, rc_col2 = st.columns([2, 1])
-        with rc_col1:
-            st.download_button(
-                label=f"📄 Download Word Receipt ({st.session_state.last_receipt['id']})",
-                data=st.session_state.last_receipt['docx_data'],
-                file_name=f"Receipt_{st.session_state.last_receipt['id']}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-            )
-        with rc_col2:
-            if st.button("Dismiss", use_container_width=True):
-                st.session_state.last_receipt = None
+        if st.button("Create Repair Job", type="primary", use_container_width=True):
+            if not customer_name.strip() or not issue.strip():
+                st.error("Customer name and reported problem are required.")
+            else:
+                conn = get_connection()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("INSERT INTO customers(name,phone,email,notes) VALUES(?,?,?,?)", (customer_name.strip(), customer_phone.strip(), customer_email.strip(), ""))
+                    customer_id = cur.lastrowid
+                    ref = generate_ref("JOB")
+                    cur.execute("""INSERT INTO repair_jobs(job_ref,customer_id,customer_name,customer_phone,device_type,brand,model,imei_serial,device_condition,customer_issue,technician,status,quoted_amount,deposit_amount,paid_amount,repair_notes)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (ref,customer_id,customer_name.strip(),customer_phone.strip(),device_type,brand.strip(),model.strip(),imei.strip(),condition.strip(),issue.strip(),tech.strip(),"Received",quoted,deposit,deposit,notes.strip()))
+                    job_id = cur.lastrowid
+                    if deposit > 0:
+                        cur.execute("INSERT INTO repair_payments(repair_job_id,amount,payment_method,cashier,reference) VALUES(?,?,?,?,?)", (job_id,deposit,"Cash",st.session_state.cashier,ref))
+                        receipt_id = f"PAY-{random.randint(100000,999999)}"
+                        cur.execute("INSERT INTO sales(receipt_id,product_name,quantity,unit_cost,unit_price,discount_amount,total_price,payment_method,cashier) VALUES(?,?,?,?,?,?,?,?,?)", (receipt_id,f"Repair Deposit - {ref}",1,0,deposit,0,deposit,"Cash",st.session_state.cashier))
+                    conn.commit()
+                    st.session_state.job_receipt = ref
+                finally:
+                    conn.close()
+                st.success(f"Repair job {ref} created successfully.")
                 st.rerun()
 
-    if df_products.empty:
-        st.info("No items available yet. Add inventory under **Stock Inventory**.")
-    else:
-        col_products, col_cart = st.columns([3, 2], gap="large")
-
-        # --- LEFT PANEL: CATALOG & SEARCH ---
-        with col_products:
-            st.markdown("##### Product Catalog")
-            categories = ["All"] + CATEGORIES
-            cat_cols = st.columns(len(categories))
-            for idx, cat in enumerate(categories):
-                with cat_cols[idx]:
-                    btn_type = "primary" if st.session_state.selected_category == cat else "secondary"
-                    if st.button(cat, key=f"cat_btn_{cat}", type=btn_type, use_container_width=True):
-                        st.session_state.selected_category = cat
-                        st.rerun()
-
-            if st.session_state.selected_category != "All":
-                filtered_df = df_products[df_products['category'] == st.session_state.selected_category]
-            else:
-                filtered_df = df_products
-
-            search_query = st.text_input("🔍 Filter Catalog", placeholder="Search by item name...")
-            if search_query:
-                # regex=False avoids crashes on names containing (, ), +, etc.
-                filtered_df = filtered_df[
-                    filtered_df['name'].str.contains(search_query, case=False, regex=False)
-                ]
-
-            st.markdown("---")
-
-            if filtered_df.empty:
-                st.caption("No products match this filter.")
-            else:
-                grid_cols = st.columns(2)
-                # Use a sequential position for column alternation instead of the
-                # original (possibly non-sequential) DataFrame index.
-                for position, (_, row) in enumerate(filtered_df.iterrows()):
-                    col_idx = position % 2
-                    with grid_cols[col_idx]:
-                        stock_qty = int(row['stock'])
-                        if stock_qty <= 0:
-                            stock_status = "Out of Stock"
-                        elif stock_qty <= 3:
-                            stock_status = f"Low Stock ({stock_qty})"
-                        else:
-                            stock_status = f"Stock: {stock_qty}"
-
-                        display_name = row['name']
-                        if str(row.get('variant_label') or '').strip():
-                            display_name = f"{row['name']} ({row['variant_label']})"
-                        btn_label = f"{display_name}\n${row['price']:.2f} | {stock_status}"
-
-                        st.markdown('<div class="product-btn">', unsafe_allow_html=True)
-                        disabled = stock_qty <= 0
-                        if st.button(
-                            btn_label,
-                            key=f"prod_btn_{row['id']}",
-                            use_container_width=True,
-                            disabled=disabled,
-                        ):
-                            existing = next(
-                                (item for item in st.session_state.cart if item['id'] == row['id']), None
-                            )
-                            if existing:
-                                if existing['Quantity'] < stock_qty:
-                                    existing['Quantity'] += 1
-                                    st.toast(f"Added another {row['name']}", icon="🛒")
-                                else:
-                                    st.warning("Quantity limit reached based on available inventory.")
-                            else:
-                                st.session_state.cart.append({
-                                    "id": row['id'],
-                                    "Product Name": row['name'],
-                                    "Unit Price ($)": row['price'],
-                                    "Quantity": 1,
-                                    "max_stock": stock_qty,
-                                })
-                                st.toast(f"{row['name']} added to cart", icon="🛒")
-                            st.rerun()
-                        st.markdown('</div>', unsafe_allow_html=True)
-
-        # --- RIGHT PANEL: ORDER CHECKOUT TERMINAL ---
-        with col_cart:
-            st.markdown("##### Current Order Summary")
-
-            if not st.session_state.cart:
-                st.caption("No items added to the cart yet — tap a product to get started.")
-            else:
-                st.markdown('<div class="cart-summary-box">', unsafe_allow_html=True)
-
-                # Simple, safe +/- steppers per line item instead of a freeform
-                # data editor (which could desync from st.session_state.cart
-                # whenever rows were added/removed inside the editor itself).
-                items_to_remove = []
-                for item in st.session_state.cart:
-                    line_col1, line_col2, line_col3, line_col4 = st.columns([3, 1.3, 1, 0.6])
-                    with line_col1:
-                        st.markdown(f"**{item['Product Name']}**")
-                        st.caption(f"${item['Unit Price ($)']:.2f} each")
-                    with line_col2:
-                        minus_col, qty_col, plus_col = st.columns([1, 1, 1])
-                        with minus_col:
-                            if st.button("−", key=f"minus_{item['id']}"):
-                                item['Quantity'] = max(1, item['Quantity'] - 1)
-                                st.rerun()
-                        with qty_col:
-                            st.markdown(f"<div style='text-align:center;padding-top:6px'>{item['Quantity']}</div>", unsafe_allow_html=True)
-                        with plus_col:
-                            if st.button("+", key=f"plus_{item['id']}"):
-                                if item['Quantity'] < item['max_stock']:
-                                    item['Quantity'] += 1
-                                else:
-                                    st.warning(f"Only {item['max_stock']} in stock.")
-                                st.rerun()
-                    with line_col3:
-                        st.markdown(
-                            f"<div style='text-align:right;padding-top:6px'>${item['Quantity'] * item['Unit Price ($)']:.2f}</div>",
-                            unsafe_allow_html=True,
-                        )
-                    with line_col4:
-                        if st.button("🗑️", key=f"rem_{item['id']}"):
-                            items_to_remove.append(item['id'])
-
-                if items_to_remove:
-                    st.session_state.cart = [
-                        item for item in st.session_state.cart if item['id'] not in items_to_remove
-                    ]
-                    st.rerun()
-
-                st.markdown('</div>', unsafe_allow_html=True)
-
-                subtotal = sum(item["Quantity"] * item["Unit Price ($)"] for item in st.session_state.cart)
-
-                # --- Discount (kept outside the form so the total updates live) ---
-                st.markdown("###### Discount")
-                disc_col1, disc_col2 = st.columns([1.3, 1])
-                with disc_col1:
-                    discount_type = st.selectbox(
-                        "Discount type",
-                        ["None", "Percentage (%)", "Fixed Amount ($)"],
-                        key="discount_type",
-                        label_visibility="collapsed",
-                    )
-                with disc_col2:
-                    discount_value = 0.0
-                    if discount_type != "None":
-                        discount_value = st.number_input(
-                            "Discount value",
-                            min_value=0.0,
-                            step=1.0,
-                            format="%.2f",
-                            key="discount_value",
-                            label_visibility="collapsed",
-                        )
-
-                if discount_type == "Percentage (%)":
-                    discount_value = min(discount_value, 100.0)
-                    discount_amount = subtotal * (discount_value / 100.0)
-                    discount_label = f"{discount_value:.0f}%"
-                elif discount_type == "Fixed Amount ($)":
-                    discount_amount = min(discount_value, subtotal)
-                    discount_label = "fixed"
-                else:
-                    discount_amount = 0.0
-                    discount_label = ""
-
-                grand_total = max(0.0, subtotal - discount_amount)
-
-                st.markdown(f"Subtotal: ${subtotal:.2f}")
-                if discount_amount > 0:
-                    st.markdown(f"Discount: −${discount_amount:.2f}")
-                st.markdown(f"### Total: **${grand_total:.2f}**")
-
-                pay_method = st.selectbox("Payment Method", PAYMENT_METHODS, key="checkout_pay_method")
-                st.button(
-                    "✅ Complete Transaction", type="primary", use_container_width=True,
-                    on_click=_complete_transaction,
-                )
-
-                checkout_feedback = st.session_state.pop("checkout_feedback", None)
-                if checkout_feedback:
-                    kind, message = checkout_feedback
-                    getattr(st, kind)(message)
-
-                if st.button("🚫 Cancel Entire Order", type="secondary", use_container_width=True):
-                    st.session_state.cart = []
-                    st.rerun()
-
-# ---------------------------------------------------------
-# VIEW 2: STOCK INVENTORY MANAGEMENT
-# ---------------------------------------------------------
-elif role == "📦 Stock Inventory":
-    st.title("📦 Stock Inventory Management")
-
-    conn = get_connection()
-    df_products = pd.read_sql_query("SELECT * FROM products", conn)
-    conn.close()
-
-    if gsheet_is_configured():
-        inv_g1, inv_g2, inv_g3 = st.columns([1, 1, 1])
-        with inv_g1:
-            st.caption("☁️ Google Inventory Log")
-        with inv_g2:
-            if st.button(
-                "🔄 Sync Inventory",
-                use_container_width=True,
-                key="sync_inventory_manual",
-                help="Mirror the complete current POS inventory into the Google Inventory Log tab.",
-            ):
-                with st.spinner("Syncing inventory to Google Sheets..."):
-                    inventory_result = sync_inventory_to_gsheet()
-                st.session_state["inventory_sync_status"] = inventory_result
-                if inventory_result.get("ok"):
-                    st.success(f"Inventory synced: {inventory_result.get('updated', 0)} product row(s).")
-                else:
-                    st.error(f"Inventory sync failed: {inventory_result.get('error') or 'Unknown error'}")
-        with inv_g3:
-            sheet_link = gsheet_url()
-            if sheet_link:
-                st.link_button("🔗 Open Google Inventory", sheet_link, use_container_width=True)
-
-        inv_sync_status = st.session_state.pop("inventory_sync_status", None)
-        if inv_sync_status:
-            if inv_sync_status.get("ok"):
-                st.caption(
-                    f"☁️ Google Inventory Log is up to date ({inv_sync_status.get('updated', 0)} product row(s))."
-                )
-            elif inv_sync_status.get("error"):
-                st.warning(f"Google Inventory Log: {inv_sync_status.get('error')}")
-
-    inv_main_list, inv_main_add = st.tabs(["📋 Product List & Manage", "➕ Add Product"])
-
-    # =========================================================
-    # SUB-INTERFACE 1: LISTING + ADMIN MANAGEMENT (edit/delete)
-    # =========================================================
-    with inv_main_list:
-        st.markdown("##### Current Stock Levels")
-        if not df_products.empty:
-            df_display = df_products.copy()
-            df_display["Status"] = df_display["stock"].apply(
-                lambda x: "Low Stock" if 0 < x <= 3 else ("Out of Stock" if x <= 0 else "In Stock")
-            )
-            df_display = df_display.rename(columns={
-                "cost_price": "Unit Cost",
-                "price": "Selling Price",
-                "variant_label": "Price Tier / Variant",
-            })
-            df_display["Margin"] = df_display["Selling Price"] - df_display["Unit Cost"]
-            column_order = [c for c in ["id", "name", "Price Tier / Variant", "category", "Unit Cost", "Selling Price", "Margin", "stock", "Status"] if c in df_display.columns]
-
-            # Quick filters so the list stays usable as the catalog grows.
-            lf_col1, lf_col2 = st.columns([2, 1])
-            with lf_col1:
-                list_search = st.text_input("🔍 Search products", placeholder="Filter by name...", key="inv_list_search")
-            with lf_col2:
-                list_category = st.selectbox("Category", ["All"] + CATEGORIES, key="inv_list_cat")
-
-            view_df = df_display[column_order].copy()
-            if list_search:
-                view_df = view_df[view_df["name"].str.contains(list_search, case=False, regex=False)]
-            if list_category != "All":
-                view_df = view_df[view_df["category"] == list_category]
-
-            total_items = int(df_display["stock"].sum())
-            stock_value = float((df_display["Unit Cost"] * df_display["stock"]).sum())
-            low_or_out = int((df_display["stock"] <= 3).sum())
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Product Lines", len(df_display))
-            m2.metric("Total Units in Stock", total_items)
-            m3.metric("Low / Out of Stock", low_or_out)
-            st.caption(f"Stock value at cost: ${stock_value:,.2f}")
-
-            if view_df.empty:
-                st.caption("No products match this filter.")
-            else:
-                st.dataframe(
-                    view_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
-                        "Selling Price": st.column_config.NumberColumn(format="$%.2f"),
-                        "Margin": st.column_config.NumberColumn(format="$%.2f"),
-                    },
-                )
-
-            st.divider()
-            st.markdown("##### Manage a Product")
-            manage_edit, manage_delete = st.tabs(["✏️ Edit Product", "🗑️ Delete Product"])
-        else:
-            st.info("No items found in stock database yet. Use the **Add Product** tab to create your first item.")
-            manage_edit, manage_delete = None, None
-
-        if manage_edit is not None:
-            with manage_edit:
-                df_products["_label"] = df_products.apply(format_product_label, axis=1)
-                label_to_id = dict(zip(df_products["_label"], df_products["id"]))
-
-                selected_label = st.selectbox("Select Product", df_products["_label"].tolist(), key="edit_select_label")
-                current_item = df_products[df_products["id"] == label_to_id[selected_label]].iloc[0]
-                pid = int(current_item["id"])
-                existing_cost = float(current_item.get("cost_price", 0.0) or 0.0)
-                existing_price = float(current_item["price"])
-                existing_markup = max(0.0, existing_price - existing_cost)
-
-                # Key widgets by product id so switching the selected product
-                # resets the fields to that product's own values.
-                edit_name = st.text_input("Product Name", value=current_item["name"], key=f"edit_name_{pid}")
-                edit_variant = st.text_input(
-                    "Price Tier / Variant Label (optional)",
-                    value=str(current_item.get("variant_label") or ""),
-                    placeholder="e.g. Retail, Wholesale, Premium",
-                    key=f"edit_variant_{pid}",
-                )
-                edit_cat = st.selectbox(
-                    "Category", CATEGORIES, index=CATEGORIES.index(current_item["category"]), key=f"edit_cat_{pid}"
-                )
-                edit_cost_col, edit_markup_col, edit_price_col = st.columns(3)
-                with edit_cost_col:
-                    edit_cost = st.number_input(
-                        "Unit Cost ($)", min_value=0.0, value=existing_cost, format="%.2f", key=f"edit_cost_{pid}"
-                    )
-                with edit_markup_col:
-                    edit_markup = st.number_input(
-                        "Markup ($)", min_value=0.0, value=existing_markup, format="%.2f", key=f"edit_markup_{pid}"
-                    )
-                edit_price = edit_cost + edit_markup
-                with edit_price_col:
-                    st.metric("Selling Price", f"${edit_price:.2f}")
-                edit_stock = st.number_input(
-                    "Exact Stock Count", min_value=0, value=int(current_item["stock"]), step=1, key=f"edit_stock_{pid}"
-                )
-                st.caption("This sets the **exact** stock count (overwrite), unlike Add Product which restocks additively.")
-
-                if st.button("Update Product", type="primary"):
-                    if not edit_name.strip():
-                        st.error("Product name cannot be empty.")
-                    else:
-                        conn = get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            "UPDATE products SET name = ?, variant_label = ?, category = ?, cost_price = ?, price = ?, stock = ? WHERE id = ?",
-                            (edit_name.strip(), edit_variant.strip(), edit_cat, edit_cost, edit_price, edit_stock, pid),
-                        )
-                        conn.commit()
-                        conn.close()
-                        if gsheet_is_configured():
-                            sync_status = sync_inventory_to_gsheet()
-                            if not sync_status.get("ok"):
-                                st.warning(f"Product updated locally, but Google Inventory Log sync failed: {sync_status.get('error')}")
-                        st.success(f"Updated product details for '{edit_name}'.")
-                        st.rerun()
-
-            with manage_delete:
-                df_products["_label"] = df_products.apply(format_product_label, axis=1)
-                label_to_id = dict(zip(df_products["_label"], df_products["id"]))
-
-                delete_label = st.selectbox("Select Product to Remove", df_products["_label"].tolist(), key="del_select")
-                delete_prod_id = label_to_id[delete_label]
-
-                if st.session_state.confirm_delete_product != delete_prod_id:
-                    if st.button("🗑️ Delete Product", type="secondary"):
-                        st.session_state.confirm_delete_product = delete_prod_id
-                        st.rerun()
-                else:
-                    st.warning(f"Are you sure you want to permanently delete **{delete_label}**? This cannot be undone.")
-                    conf_col1, conf_col2 = st.columns(2)
-                    with conf_col1:
-                        if st.button("Yes, delete it", type="primary", use_container_width=True):
-                            conn = get_connection()
-                            cursor = conn.cursor()
-                            cursor.execute("DELETE FROM products WHERE id = ?", (int(delete_prod_id),))
-                            conn.commit()
-                            conn.close()
-                            st.session_state.confirm_delete_product = None
-                            if gsheet_is_configured():
-                                sync_status = sync_inventory_to_gsheet()
-                                if not sync_status.get("ok"):
-                                    st.warning(f"Product removed locally, but Google Inventory Log sync failed: {sync_status.get('error')}")
-                            st.success(f"Removed '{delete_label}' from inventory.")
-                            st.rerun()
-                    with conf_col2:
-                        if st.button("Cancel", use_container_width=True):
-                            st.session_state.confirm_delete_product = None
-                            st.rerun()
-
-    # =========================================================
-    # SUB-INTERFACE 2: ADD NEW PRODUCT
-    # =========================================================
-    with inv_main_add:
-        st.markdown("##### Add a New Product")
-        st.caption("Enter what you pay (Unit Cost) and how much to add on top (Markup) — the Selling Price is calculated for you.")
-        st.text_input("Product Name", key="add_p_name")
-        st.text_input(
-            "Price Tier / Variant Label (optional)",
-            placeholder="e.g. Retail, Wholesale, Premium",
-            help="Use this to stock the same product name at more than one markup — e.g. the same tire sold "
-                 "at a 'Retail' price and a 'Wholesale' price as two separate lines.",
-            key="add_p_variant",
-        )
-        st.selectbox("Category", CATEGORIES, key="add_p_cat")
-        cost_col, markup_col, price_col = st.columns(3)
-        with cost_col:
-            st.number_input("Unit Cost ($)", min_value=0.0, format="%.2f", help="What you pay to acquire/stock this item.", key="add_p_cost")
-        with markup_col:
-            st.number_input("Markup ($)", min_value=0.0, format="%.2f", help="Amount added on top of unit cost.", key="add_p_markup")
-        preview_price = st.session_state.get("add_p_cost", 0.0) + st.session_state.get("add_p_markup", 0.0)
-        with price_col:
-            st.metric("Selling Price", f"${preview_price:.2f}")
-        st.number_input("Stock Quantity", min_value=0, step=1, key="add_p_stock")
-        st.caption(
-            "If a product with this **exact same name, price, and tier label** already exists, the quantity "
-            "entered here will be **added** to its existing stock (restock). A different price or label "
-            "creates a separate line — useful for selling the same item at more than one markup."
-        )
-
-        st.button("Save Item", type="primary", on_click=_save_new_product)
-
-        feedback = st.session_state.pop("add_product_feedback", None)
-        if feedback:
-            kind, message = feedback
-            getattr(st, kind)(message)
-
-# ---------------------------------------------------------
-# VIEW 3: ADMIN DASHBOARD & REPORTS
-# ---------------------------------------------------------
-elif role == "📊 Admin Dashboard":
-    st.title("📊 Admin Dashboard & Daily Records")
-
-    admin_tab1, admin_tab2 = st.tabs(["📈 Sales Reporting", "👤 Cashier Management"])
-
-    with admin_tab1:
-        st.caption("Sales automatically start fresh each calendar day. Inventory and cashier records are kept until you manually clear them.")
+    with tab_jobs:
+        f1,f2,f3 = st.columns([2,1,1])
+        search = f1.text_input("Search", placeholder="Job ref, customer, phone, IMEI, model...")
+        selected_status = f2.selectbox("Status", ["All"] + REPAIR_STATUSES)
+        sort_order = f3.selectbox("Order", ["Newest First", "Oldest First"])
         conn = get_connection()
-        df_sales = pd.read_sql_query("SELECT * FROM sales ORDER BY timestamp DESC", conn)
-        df_cashiers = pd.read_sql_query("SELECT name FROM cashiers", conn)
+        query = "SELECT * FROM repair_jobs WHERE 1=1"
+        params=[]
+        if selected_status != "All": query += " AND status=?"; params.append(selected_status)
+        if search:
+            query += " AND (job_ref LIKE ? OR customer_name LIKE ? OR customer_phone LIKE ? OR imei_serial LIKE ? OR model LIKE ? OR brand LIKE ?)"
+            q=f"%{search}%"; params += [q,q,q,q,q,q]
+        query += " ORDER BY created_at " + ("DESC" if sort_order == "Newest First" else "ASC")
+        jobs = pd.read_sql_query(query, conn, params=params)
         conn.close()
 
-        f_col1, f_col2, f_col3 = st.columns(3)
-        with f_col1:
-            selected_date = st.date_input("Filter Date", date.today())
-        with f_col2:
-            cashier_options = ["All"] + (df_cashiers["name"].tolist() if not df_cashiers.empty else [])
-            selected_cashier = st.selectbox("Filter Cashier", cashier_options)
-        with f_col3:
-            selected_payment = st.selectbox("Filter Payment Method", ["All"] + PAYMENT_METHODS)
-
-        if not df_sales.empty:
-            df_sales['date_only'] = pd.to_datetime(df_sales['timestamp']).dt.date
-            filtered_df = df_sales[df_sales['date_only'] == selected_date].copy()
-
-            if selected_cashier != "All":
-                filtered_df = filtered_df[filtered_df['cashier'] == selected_cashier]
-            if selected_payment != "All":
-                filtered_df = filtered_df[filtered_df['payment_method'] == selected_payment]
-
-            filtered_df.drop(columns=['date_only'], inplace=True, errors='ignore')
+        if jobs.empty:
+            st.info("No repair jobs found.")
         else:
-            filtered_df = pd.DataFrame()
+            st.dataframe(jobs[["job_ref","customer_name","customer_phone","brand","model","status","quoted_amount","paid_amount","created_at"]].rename(columns={"job_ref":"Job Ref","customer_name":"Customer","customer_phone":"Phone","brand":"Brand","model":"Model","status":"Status","quoted_amount":"Quoted","paid_amount":"Paid","created_at":"Created"}), use_container_width=True, hide_index=True)
+            st.download_button("⬇️ Export Repair Jobs", export_excel(jobs, "Repair Jobs"), "repair_jobs.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        col1, col2, col3, col4, col5 = st.columns(5)
-        daily_revenue = filtered_df['total_price'].sum() if not filtered_df.empty else 0.0
-        daily_items = filtered_df['quantity'].sum() if not filtered_df.empty else 0
-        daily_discounts = (
-            filtered_df['discount_amount'].sum()
-            if not filtered_df.empty and 'discount_amount' in filtered_df.columns
-            else 0.0
-        )
-        daily_profit = (
-            (filtered_df['total_price'] - filtered_df['unit_cost'] * filtered_df['quantity']).sum()
-            if not filtered_df.empty and 'unit_cost' in filtered_df.columns
-            else 0.0
-        )
-        top_product = (
-            filtered_df.groupby('product_name')['quantity'].sum().idxmax()
-            if not filtered_df.empty else "N/A"
-        )
+            st.markdown("#### Manage Job")
+            ref = st.selectbox("Select Job", jobs["job_ref"].tolist())
+            conn = get_connection(); job = conn.execute("SELECT * FROM repair_jobs WHERE job_ref=?", (ref,)).fetchone(); cols=[d[0] for d in conn.execute("SELECT * FROM repair_jobs LIMIT 1").description]; conn.close()
+            jobd=dict(zip(cols,job))
+            remaining=max(0,float(jobd["quoted_amount"] or 0)-float(jobd["paid_amount"] or 0))
+            st.info(f"**{jobd['job_ref']}** — {jobd['customer_name']} — {jobd['brand']} {jobd['model']} — Balance: **{money(remaining)}**")
+            a,b,c = st.columns(3)
+            with a:
+                new_status=st.selectbox("Status", REPAIR_STATUSES, index=REPAIR_STATUSES.index(jobd["status"]) if jobd["status"] in REPAIR_STATUSES else 0)
+            with b:
+                diagnosis=st.text_area("Diagnosis", value=jobd["diagnosis"] or "")
+            with c:
+                technician=st.text_input("Technician", value=jobd["technician"] or "")
+            repair_notes=st.text_area("Repair Notes", value=jobd["repair_notes"] or "")
+            quoted_edit=st.number_input("Quoted Amount ($)", min_value=0.0, value=float(jobd["quoted_amount"] or 0), step=1.0)
+            if st.button("Save Job Changes", type="primary"):
+                conn=get_connection(); conn.execute("UPDATE repair_jobs SET status=?,diagnosis=?,technician=?,repair_notes=?,quoted_amount=?,updated_at=CURRENT_TIMESTAMP,ready_at=CASE WHEN ?='Ready for Collection' THEN CURRENT_TIMESTAMP ELSE ready_at END,collected_at=CASE WHEN ?='Collected' THEN CURRENT_TIMESTAMP ELSE collected_at END WHERE id=?", (new_status,diagnosis,technician,repair_notes,quoted_edit,new_status,new_status,jobd["id"])); conn.commit(); conn.close(); st.success("Repair job updated."); st.rerun()
 
-        col1.metric("Revenue", f"${daily_revenue:.2f}")
-        col2.metric("Items Sold", int(daily_items))
-        col3.metric("Discounts Given", f"${daily_discounts:.2f}")
-        col4.metric("Profit", f"${daily_profit:.2f}")
-        col5.metric("Top Moving Product", top_product)
-
-        st.markdown(f"##### Sales Log — {selected_date}")
-        if filtered_df.empty:
-            st.caption("No sales recorded for this filter combination.")
-        else:
-            display_df = filtered_df.copy()
-            if "unit_cost" in display_df.columns:
-                display_df["profit"] = display_df["total_price"] - (display_df["unit_cost"] * display_df["quantity"])
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "unit_cost": st.column_config.NumberColumn("Unit Cost", format="$%.2f"),
-                    "unit_price": st.column_config.NumberColumn("Unit Price", format="$%.2f"),
-                    "discount_amount": st.column_config.NumberColumn("Discount", format="$%.2f"),
-                    "total_price": st.column_config.NumberColumn("Total", format="$%.2f"),
-                    "profit": st.column_config.NumberColumn("Profit", format="$%.2f"),
-                },
-            )
-
-            excel_data = build_formatted_sales_excel(filtered_df, f"Sales_{selected_date}")
-
-            st.download_button(
-                label=f"📊 Download Excel Sales Report ({selected_date})",
-                data=excel_data,
-                file_name=f"Sales_Report_{selected_date}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-            st.caption(
-                "Includes per-sale Unit Cost, Unit Price, Discount, Total, and Profit. "
-                "Sales recorded before this update will show $0.00 unit cost since that wasn't tracked yet."
-            )
-
-            st.markdown("---")
-            st.markdown("###### ☁️ Google Sheets (online shared copy)")
-            if not GSHEETS_LIB_AVAILABLE:
-                st.info(
-                    "Google Sheets sync isn't available yet — add `requests` to requirements.txt and redeploy to enable it."
-                )
-            elif not gsheet_is_configured():
-                st.info(
-                    "Not connected yet. This uses a **free Google Apps Script Web App** — no Google Cloud project "
-                    "or billing needed. Once you add the Web App URL to your app's secrets, every completed sale "
-                    "will push here automatically, and you'll get a manual **Sync Now** button as a backup. "
-                    "Ask me for setup steps if you'd like."
-                )
-            else:
-                st.success("☁️ Google Sheets connection is configured. New completed sales are sent automatically, with automatic retry if a temporary connection problem occurs.")
-                gs_col1, gs_col2 = st.columns([1, 1])
-                with gs_col1:
-                    sheet_link = gsheet_url()
-                    if sheet_link:
-                        st.link_button("🔗 Open Shared Google Sheet", sheet_link, use_container_width=True)
-                    else:
-                        st.caption("Add `gsheet_share_url` to secrets to show an Open link here.")
-                with gs_col2:
-                    if st.button(
-                        "🔄 Sync Now",
-                        use_container_width=True,
-                        help="Sync the complete local sales history. Existing Sale IDs are ignored by the Google Apps Script, so this is safe to run again.",
-                    ):
-                        with st.spinner("Syncing all local sales to Google Sheets..."):
-                            result = sync_all_sales_to_gsheet()
-                        st.session_state.gsheet_last_manual_sync = result
-                        if not result["ok"]:
-                            st.error(
-                                f"Google Sheets sync failed after {result.get('attempts', 0)} attempt(s): "
-                                f"{result.get('error') or 'Unknown error'}"
-                            )
-                        elif result["added"] == 0:
-                            st.success(
-                                f"Google Sheet is already up to date. Checked all local sales "
-                                f"({result.get('attempts', 1)} attempt)."
-                            )
-                        else:
-                            st.success(
-                                f"Synced {result['added']} new sale row(s) to Google Sheets "
-                                f"in {result.get('attempts', 1)} attempt(s)."
-                            )
-
-                    last_manual_sync = st.session_state.get("gsheet_last_manual_sync")
-                    if last_manual_sync and last_manual_sync.get("ok"):
-                        st.caption(
-                            f"Last manual sync: {last_manual_sync.get('added', 0)} new row(s) added; "
-                            f"{last_manual_sync.get('attempts', 1)} attempt(s)."
-                        )
-
-        # -----------------------------------------------------
-        # GOOGLE INVENTORY
-        # -----------------------------------------------------
-        st.markdown("---")
-        st.markdown("###### 📦 Google Inventory Log")
-        if not gsheet_is_configured():
-            st.info("Configure Google Sheets above to enable the online Inventory Log.")
-        else:
-            inv_g_col1, inv_g_col2 = st.columns([1, 1])
-            with inv_g_col1:
-                sheet_link = gsheet_url()
-                if sheet_link:
-                    st.link_button("🔗 Open Google Inventory", sheet_link, use_container_width=True)
-            with inv_g_col2:
-                if st.button(
-                    "🔄 Sync Inventory Now",
-                    use_container_width=True,
-                    key="admin_sync_inventory",
-                    help="Replace the Google Inventory Log data with the complete current local inventory.",
-                ):
-                    with st.spinner("Syncing complete inventory to Google Sheets..."):
-                        inventory_result = sync_inventory_to_gsheet()
-                    st.session_state["inventory_sync_status"] = inventory_result
-                    if inventory_result.get("ok"):
-                        st.success(
-                            f"Google Inventory Log updated with {inventory_result.get('updated', 0)} product row(s)."
-                        )
-                    else:
-                        st.error(
-                            f"Google Inventory sync failed after {inventory_result.get('attempts', 0)} attempt(s): "
-                            f"{inventory_result.get('error') or 'Unknown error'}"
-                        )
-
-        # -----------------------------------------------------
-        # DANGER ZONE: DATA CLEAR CONTROLS
-        # -----------------------------------------------------
-        st.markdown("---")
-        st.markdown("### ⚠️ Danger Zone")
-        st.warning(
-            "These controls permanently delete data. **Clear Sales Only** removes sales history "
-            "from both the POS and the Google Sales Log while keeping products and cashiers. "
-            "**Clear Inventory Only** removes products/stock from both the POS and the Google Inventory Log while keeping sales and cashiers. "
-            "**Clear Everything** removes all POS data plus all Google Sales Log and Google Inventory Log rows. These actions cannot be undone."
-        )
-
-        danger_col1, danger_col2, danger_col3 = st.columns(3)
-
-        with danger_col1:
-            st.markdown("#### 🧾 Clear Sales Only")
-            st.caption("Deletes all sales history locally and from Google Sheets. Products and cashiers remain.")
-            if not st.session_state.show_clear_sales_confirm:
-                if st.button(
-                    "🧾 Clear Sales Only",
-                    type="secondary",
-                    use_container_width=True,
-                    key="open_clear_sales",
-                    help="Permanently delete all sales history from the POS and Google Sales Log.",
-                ):
-                    st.session_state.show_clear_sales_confirm = True
-                    st.session_state.clear_sales_confirm = ""
-                    st.rerun()
-            else:
-                st.error("Type CLEAR SALES to confirm permanent deletion of all sales history.")
-                st.text_input(
-                    "Confirmation",
-                    key="clear_sales_confirm",
-                    placeholder="CLEAR SALES",
-                    label_visibility="collapsed",
-                )
-                c1, c2 = st.columns(2)
-                with c1:
-                    confirm_sales = st.button(
-                        "Delete Sales",
-                        type="primary",
-                        use_container_width=True,
-                        key="confirm_clear_sales",
-                        disabled=st.session_state.clear_sales_confirm != "CLEAR SALES",
-                    )
-                with c2:
-                    cancel_sales = st.button("Cancel", use_container_width=True, key="cancel_clear_sales")
-
-                if cancel_sales:
-                    st.session_state.show_clear_sales_confirm = False
-                    st.session_state.clear_sales_confirm = ""
-                    st.rerun()
-
-                if confirm_sales:
-                    with st.spinner("Clearing sales history from POS and Google Sheets..."):
-                        result = clear_sales_everywhere()
-                    if result.get("ok"):
-                        reset_runtime_state_after_clear()
-                        st.success(
-                            f"✅ Sales history cleared. Google Sales Log rows removed: "
-                            f"{result.get('cloud_cleared', 0)}."
-                        )
-                        st.rerun()
-                    else:
-                        st.error(result.get("error") or "Could not clear sales history.")
-
-        with danger_col2:
-            st.markdown("#### 📦 Clear Inventory Only")
-            st.caption("Deletes all products and stock from both the POS and Google Inventory Log. Sales history and cashiers remain.")
-            if not st.session_state.show_clear_inventory_confirm:
-                if st.button(
-                    "📦 Clear Inventory Only",
-                    type="secondary",
-                    use_container_width=True,
-                    key="open_clear_inventory",
-                    help="Permanently delete all products and stock while preserving sales and cashiers.",
-                ):
-                    st.session_state.show_clear_inventory_confirm = True
-                    st.session_state.clear_inventory_confirm = ""
-                    st.rerun()
-            else:
-                st.error("Type CLEAR INVENTORY to confirm permanent deletion of all products and stock.")
-                st.text_input(
-                    "Confirmation",
-                    key="clear_inventory_confirm",
-                    placeholder="CLEAR INVENTORY",
-                    label_visibility="collapsed",
-                )
-                c1, c2 = st.columns(2)
-                with c1:
-                    confirm_inventory = st.button(
-                        "Delete Inventory",
-                        type="primary",
-                        use_container_width=True,
-                        key="confirm_clear_inventory",
-                        disabled=st.session_state.clear_inventory_confirm != "CLEAR INVENTORY",
-                    )
-                with c2:
-                    cancel_inventory = st.button("Cancel", use_container_width=True, key="cancel_clear_inventory")
-
-                if cancel_inventory:
-                    st.session_state.show_clear_inventory_confirm = False
-                    st.session_state.clear_inventory_confirm = ""
-                    st.rerun()
-
-                if confirm_inventory:
-                    with st.spinner("Clearing inventory from POS and Google Sheets..."):
-                        result = clear_inventory()
-                    if result.get("ok"):
-                        st.session_state.cart = []
-                        st.session_state.selected_category = "All"
-                        st.session_state.clear_inventory_confirm = ""
-                        st.session_state.show_clear_inventory_confirm = False
-                        st.success(
-                            f"✅ Inventory cleared. Local products/stock removed and Google Inventory Log rows removed: "
-                            f"{result.get('cloud_cleared', 0)}. Sales and cashiers were kept."
-                        )
-                        st.rerun()
-                    else:
-                        st.error(result.get("error") or "Could not clear inventory.")
-
-        with danger_col3:
-            st.markdown("#### 🗑️ Clear Everything")
-            st.caption("Deletes products, stock, sales, cashiers, Google Sales Log rows, and Google Inventory Log rows.")
-            if not st.session_state.show_clear_everything_confirm:
-                if st.button(
-                    "🗑️ Clear Everything",
-                    type="secondary",
-                    use_container_width=True,
-                    key="open_clear_everything",
-                    help="Permanently delete all POS data and all Google Sheets sales rows.",
-                ):
-                    st.session_state.show_clear_everything_confirm = True
-                    st.session_state.clear_everything_confirm = ""
-                    st.rerun()
-            else:
-                st.error("Type CLEAR EVERYTHING to confirm permanent deletion of all POS data and Google sales rows.")
-                st.text_input(
-                    "Confirmation",
-                    key="clear_everything_confirm",
-                    placeholder="CLEAR EVERYTHING",
-                    label_visibility="collapsed",
-                )
-                c1, c2 = st.columns(2)
-                with c1:
-                    confirm_clear = st.button(
-                        "Permanently Clear Everything",
-                        type="primary",
-                        use_container_width=True,
-                        key="confirm_clear_everything",
-                        disabled=st.session_state.clear_everything_confirm != "CLEAR EVERYTHING",
-                    )
-                with c2:
-                    cancel_clear = st.button("Cancel", use_container_width=True, key="cancel_clear_everything")
-
-                if cancel_clear:
-                    st.session_state.show_clear_everything_confirm = False
-                    st.session_state.clear_everything_confirm = ""
-                    st.rerun()
-
-                if confirm_clear:
-                    with st.spinner("Clearing local POS data and Google Sheets..."):
-                        clear_result = clear_everything()
-
-                    if clear_result.get("ok"):
-                        reset_runtime_state_after_clear()
-                        st.success(
-                            "✅ Everything has been cleared successfully. Products, stock, sales history, "
-                            "cashiers, Google Sales Log rows, and Google Inventory Log rows have been removed."
-                        )
-                        st.rerun()
-                    else:
-                        st.error(clear_result.get("error") or "Could not clear everything.")
-
-    with admin_tab2:
-        st.markdown("##### Add Cashier Profile")
-        with st.form("add_cashier_form"):
-            new_cashier_name = st.text_input("Full Name")
-            add_cashier_btn = st.form_submit_button("Register Cashier", type="primary")
-
-            if add_cashier_btn:
-                if not new_cashier_name.strip():
-                    st.error("Name cannot be empty.")
+            st.markdown("##### Record Payment")
+            p1,p2,p3=st.columns(3)
+            with p1: payment_amount=st.number_input("Payment Amount ($)", min_value=0.0, max_value=remaining, step=1.0, format="%.2f", key="job_payment_amount")
+            with p2: payment_method=st.selectbox("Payment Method", PAYMENT_METHODS, key="job_payment_method")
+            with p3: payment_ref=st.text_input("Payment Reference", key="job_payment_ref")
+            if st.button("Record Payment", use_container_width=True):
+                if payment_amount <= 0:
+                    st.error("Enter a payment amount.")
                 else:
+                    conn=get_connection()
                     try:
-                        conn = get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute("INSERT INTO cashiers (name) VALUES (?)", (new_cashier_name.strip(),))
+                        cur=conn.cursor(); cur.execute("INSERT INTO repair_payments(repair_job_id,amount,payment_method,cashier,reference) VALUES(?,?,?,?,?)", (jobd["id"],payment_amount,payment_method,st.session_state.cashier,payment_ref.strip()))
+                        cur.execute("UPDATE repair_jobs SET paid_amount=paid_amount+?,deposit_amount=deposit_amount+?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (payment_amount,payment_amount,jobd["id"]))
+                        receipt_id=f"PAY-{random.randint(100000,999999)}"
+                        cur.execute("INSERT INTO sales(receipt_id,product_name,quantity,unit_cost,unit_price,discount_amount,total_price,payment_method,cashier) VALUES(?,?,?,?,?,?,?,?,?)", (receipt_id,f"Repair Payment - {jobd['job_ref']}",1,0,payment_amount,0,payment_amount,payment_method,st.session_state.cashier))
                         conn.commit()
-                        conn.close()
-                        st.success(f"Cashier '{new_cashier_name}' registered.")
-                        st.rerun()
-                    except sqlite3.IntegrityError:
-                        st.error("Cashier already exists.")
+                    finally: conn.close()
+                    st.success(f"Payment of {money(payment_amount)} recorded."); st.rerun()
 
-        st.markdown("##### Registered Cashiers")
-        conn = get_connection()
-        df_cashiers = pd.read_sql_query("SELECT * FROM cashiers", conn)
-        conn.close()
+            conn=get_connection(); parts=pd.read_sql_query("SELECT * FROM repair_job_parts WHERE repair_job_id=?", conn, params=(jobd["id"],)); conn.close()
+            if not parts.empty:
+                st.markdown("##### Parts Used")
+                st.dataframe(parts[["product_name","quantity","unit_price"]], use_container_width=True, hide_index=True)
+            st.markdown("##### Job History / Payments")
+            conn=get_connection(); payments=pd.read_sql_query("SELECT created_at,amount,payment_method,cashier,reference FROM repair_payments WHERE repair_job_id=? ORDER BY created_at DESC", conn, params=(jobd["id"],)); conn.close()
+            if payments.empty: st.caption("No payments recorded.")
+            else: st.dataframe(payments, use_container_width=True, hide_index=True)
 
-        if not df_cashiers.empty:
-            st.dataframe(df_cashiers, use_container_width=True, hide_index=True)
+# ============================================================
+# SALES / PAYMENTS
+# ============================================================
+elif role == "💳 Sales / Payments":
+    st.title("💳 Daily Sales & Payments")
+    st.caption("This screen records daily cash/card/bank transactions. Repair jobs remain stored separately and do not reset.")
+    conn=get_connection(); sales=pd.read_sql_query("SELECT * FROM sales ORDER BY timestamp DESC", conn); conn.close()
+    today_df=sales[pd.to_datetime(sales["timestamp"]).dt.date == date.today()] if not sales.empty else pd.DataFrame()
+    c1,c2,c3=st.columns(3); c1.metric("Today's Revenue", money(today_df["total_price"].sum() if not today_df.empty else 0)); c2.metric("Transactions", len(today_df)); c3.metric("Cash", money(today_df.loc[today_df.payment_method=="Cash","total_price"].sum() if not today_df.empty else 0))
+    if sales.empty: st.info("No payments recorded today.")
+    else:
+        st.dataframe(sales.rename(columns={"receipt_id":"Reference","product_name":"Description","quantity":"Qty","unit_price":"Amount","total_price":"Total","payment_method":"Payment","cashier":"Staff","timestamp":"Time"})[["id","Reference","Description","Qty","Amount","Total","Payment","Staff","Time"]], use_container_width=True, hide_index=True)
+        st.download_button("⬇️ Export Daily Payments", export_excel(today_df if not today_df.empty else sales, "Daily Payments"), "daily_payments.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ============================================================
+# PARTS INVENTORY
+# ============================================================
+elif role == "📦 Parts Inventory":
+    st.title("📦 Parts & Accessories Inventory")
+    st.caption("Manage replacement screens, batteries, charging parts, tools and other stock used by the repair shop.")
+    if gsheet_is_configured():
+        g1,g2=st.columns(2)
+        with g1:
+            if st.button("🔄 Sync Inventory to Google Sheets", use_container_width=True):
+                result=sync_inventory_to_gsheet(); st.success(f"Inventory synced ({result.get('updated',0)} rows).") if result.get("ok") else st.error(result.get("error","Sync failed"))
+        with g2:
+            link=gsheet_url()
+            if link: st.link_button("🔗 Open Google Sheet", link, use_container_width=True)
+    list_tab, add_tab = st.tabs(["📋 Stock List", "➕ Add / Restock Part"])
+    with list_tab:
+        conn=get_connection(); products=pd.read_sql_query("SELECT * FROM products ORDER BY name, id", conn); conn.close()
+        if products.empty: st.info("No parts in inventory yet.")
         else:
-            st.caption("No registered cashiers yet.")
+            products["Status"]=products.stock.apply(lambda x:"Out of Stock" if x<=0 else ("Low Stock" if x<=3 else "In Stock"))
+            products["Margin"]=products.price-products.cost_price
+            st.dataframe(products[["id","name","variant_label","category","cost_price","price","Margin","stock","Status"]].rename(columns={"id":"ID","name":"Part","variant_label":"Variant","category":"Category","cost_price":"Cost","price":"Selling Price","stock":"Stock"}), use_container_width=True, hide_index=True)
+            st.download_button("⬇️ Export Inventory", export_excel(products, "Inventory"), "phone_parts_inventory.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.markdown("##### Edit Stock / Price")
+            pid=st.selectbox("Part", products.id.tolist(), format_func=lambda x: f"#{x} — {products.loc[products.id==x,'name'].iloc[0]}")
+            row=products[products.id==pid].iloc[0]
+            e1,e2,e3=st.columns(3)
+            with e1: new_stock=st.number_input("Stock", min_value=0, value=int(row.stock), step=1)
+            with e2: new_cost=st.number_input("Cost ($)", min_value=0.0, value=float(row.cost_price), step=1.0)
+            with e3: new_price=st.number_input("Selling Price ($)", min_value=0.0, value=float(row.price), step=1.0)
+            if st.button("Save Inventory Changes", type="primary"):
+                conn=get_connection(); conn.execute("UPDATE products SET stock=?,cost_price=?,price=? WHERE id=?", (new_stock,new_cost,new_price,pid)); conn.commit(); conn.close();
+                if gsheet_is_configured(): sync_inventory_to_gsheet()
+                st.success("Inventory updated."); st.rerun()
+    with add_tab:
+        st.text_input("Part Name", key="part_name")
+        st.text_input("Variant / Compatible Model", placeholder="iPhone 11 / A2111", key="part_variant")
+        st.selectbox("Category", PRODUCT_CATEGORIES, key="part_category")
+        a,b,c=st.columns(3)
+        with a: cost=st.number_input("Unit Cost ($)", min_value=0.0, step=1.0, key="part_cost")
+        with b: markup=st.number_input("Markup ($)", min_value=0.0, step=1.0, key="part_markup")
+        with c: st.metric("Selling Price", money(cost+markup))
+        qty=st.number_input("Quantity to Add", min_value=0, step=1, key="part_qty")
+        if st.button("Save / Restock Part", type="primary", use_container_width=True):
+            name=st.session_state.part_name.strip(); variant=st.session_state.part_variant.strip(); price=cost+markup
+            if not name: st.error("Part name is required.")
+            else:
+                conn=get_connection(); existing=conn.execute("SELECT id FROM products WHERE name=? AND IFNULL(variant_label,'')=? AND price=?", (name,variant,price)).fetchone()
+                if existing: conn.execute("UPDATE products SET stock=stock+?,cost_price=?,category=? WHERE id=?", (qty,cost,st.session_state.part_category,existing[0]))
+                else: conn.execute("INSERT INTO products(name,variant_label,category,cost_price,price,stock) VALUES(?,?,?,?,?,?)", (name,variant,st.session_state.part_category,cost,price,qty))
+                conn.commit(); conn.close()
+                if gsheet_is_configured(): sync_inventory_to_gsheet()
+                st.success("Part saved/restocked."); st.rerun()
+
+# ============================================================
+# REPORTS
+# ============================================================
+elif role == "📊 Reports":
+    st.title("📊 Phone Repair Reports")
+    tab1,tab2,tab3=st.tabs(["Repair Jobs","Revenue","Customers"])
+    with tab1:
+        conn=get_connection(); jobs=pd.read_sql_query("SELECT * FROM repair_jobs ORDER BY created_at DESC", conn); conn.close()
+        if jobs.empty: st.info("No repair jobs yet.")
+        else:
+            r1,r2,r3,r4=st.columns(4)
+            r1.metric("Total Jobs",len(jobs)); r2.metric("Open",int((~jobs.status.isin(["Collected","Cancelled"])).sum())); r3.metric("Collected",int((jobs.status=="Collected").sum())); r4.metric("Outstanding",money((jobs.quoted_amount-jobs.paid_amount).clip(lower=0).sum()))
+            st.dataframe(jobs.groupby("status").size().reset_index(name="Jobs"), use_container_width=True, hide_index=True)
+            st.download_button("⬇️ Export All Repair Jobs", export_excel(jobs,"Repair Jobs"),"repair_jobs_report.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with tab2:
+        conn=get_connection(); sales=pd.read_sql_query("SELECT * FROM sales ORDER BY timestamp DESC", conn); conn.close()
+        if sales.empty: st.info("No revenue records.")
+        else:
+            sales["Date"]=pd.to_datetime(sales.timestamp).dt.date
+            summary=sales.groupby(["Date","payment_method"],as_index=False)["total_price"].sum().rename(columns={"payment_method":"Payment Method","total_price":"Revenue"})
+            st.dataframe(summary,use_container_width=True,hide_index=True)
+            st.download_button("⬇️ Export Revenue Report",export_excel(sales,"Revenue"),"revenue_report.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with tab3:
+        conn=get_connection(); customers=pd.read_sql_query("SELECT * FROM customers ORDER BY updated_at DESC", conn); conn.close()
+        st.dataframe(customers,use_container_width=True,hide_index=True) if not customers.empty else st.info("No customers yet.")
+
+# ============================================================
+# ADMIN
+# ============================================================
+elif role == "🔐 Admin":
+    st.title("🔐 Admin Dashboard")
+    if not st.session_state.admin_authenticated:
+        st.info("Enter the Admin PIN to access management tools.")
+        pin=st.text_input("Admin PIN", type="password")
+        if st.button("Unlock Admin", type="primary"):
+            if pin == ADMIN_PIN:
+                st.session_state.admin_authenticated=True; st.rerun()
+            else: st.error("Incorrect Admin PIN.")
+    else:
+        if st.button("🔒 Lock Admin"):
+            st.session_state.admin_authenticated=False; st.rerun()
+        tabs=st.tabs(["👥 Staff","🧹 Data Management","☁️ Google Sheets","⚙️ System"])
+        with tabs[0]:
+            st.subheader("Staff / Cashiers")
+            name=st.text_input("Staff Name", key="admin_staff_name")
+            if st.button("Add Staff", type="primary"):
+                if name.strip():
+                    try:
+                        conn=get_connection(); conn.execute("INSERT INTO cashiers(name) VALUES(?)",(name.strip(),)); conn.commit(); conn.close(); st.success("Staff member added."); st.rerun()
+                    except sqlite3.IntegrityError: st.error("That staff member already exists.")
+                else: st.error("Enter a name.")
+            conn=get_connection(); staff=pd.read_sql_query("SELECT * FROM cashiers ORDER BY name",conn); conn.close(); st.dataframe(staff,use_container_width=True,hide_index=True) if not staff.empty else st.caption("No staff registered.")
+        with tabs[1]:
+            st.subheader("Clear Data")
+            st.warning("These actions permanently delete local records. Repair jobs and customer records are separate from daily sales.")
+            if st.button("Clear Daily Sales / Payments", use_container_width=True):
+                conn=get_connection(); conn.execute("DELETE FROM sales"); conn.execute("DELETE FROM sqlite_sequence WHERE name='sales'"); conn.commit(); conn.close();
+                if gsheet_is_configured(): clear_google("clear_sales")
+                st.success("Daily sales/payment records cleared.")
+            if st.button("Clear Parts Inventory", use_container_width=True):
+                conn=get_connection(); conn.execute("DELETE FROM products"); conn.execute("DELETE FROM sqlite_sequence WHERE name='products'"); conn.commit(); conn.close();
+                if gsheet_is_configured(): clear_google("clear_inventory")
+                st.success("Parts inventory cleared.")
+            st.markdown("#### Full Reset")
+            confirm=st.text_input('Type "RESET PHONE SHOP" to confirm', key="full_reset_confirm")
+            if st.button("⚠️ Reset Repair Shop Data", type="secondary"):
+                if confirm == "RESET PHONE SHOP":
+                    conn=get_connection()
+                    try:
+                        for table in ["repair_payments","repair_job_parts","repair_jobs","customers","sales","products","cashiers"]: conn.execute(f"DELETE FROM {table}")
+                        conn.commit()
+                    finally: conn.close()
+                    if gsheet_is_configured(): clear_google("clear_all")
+                    st.success("Phone repair shop data has been reset."); st.rerun()
+                else: st.error("Confirmation text does not match.")
+        with tabs[2]:
+            st.subheader("Google Sheets")
+            if not gsheet_is_configured(): st.info("Google Sheets is not configured or the requests package is unavailable.")
+            else:
+                st.success("Google Sheets connection is configured.")
+                if gsheet_url(): st.link_button("🔗 Open Shared Google Sheet", gsheet_url())
+                if st.button("🔄 Sync All Daily Sales"):
+                    conn=get_connection(); df=pd.read_sql_query("SELECT * FROM sales ORDER BY id",conn); conn.close(); result=sync_sales_to_gsheet(df); st.success(f"Synced {result.get('added',0)} row(s).") if result.get("ok") else st.error(result.get("error","Sync failed"))
+                if st.button("🔄 Sync Parts Inventory"):
+                    result=sync_inventory_to_gsheet(); st.success(f"Inventory sync complete: {result.get('updated',0)} row(s).") if result.get("ok") else st.error(result.get("error","Sync failed"))
+        with tabs[3]:
+            st.subheader("System Information")
+            st.write("Database:", DB_FILE)
+            st.write("Daily sales reset:", "Enabled")
+            st.write("Repair jobs reset daily:", "No")
+            st.write("Google Sheets:", "Configured" if gsheet_is_configured() else "Not configured")
+            st.caption("Change ADMIN_PIN near the top of app.py before deploying.")
